@@ -130,12 +130,9 @@ impl<'r, W: Write> Serializer<'r, W> {
         Ok(())
     }
 
-    fn write_declaration(&mut self) -> Result<(), DeError> {
-        self.writer.write_event(Event::Decl(BytesDecl::new(
-            "1.0".as_bytes(),
-            Some("UTF-8".as_bytes()),
-            None,
-        )))?;
+    fn write_declaration(&mut self, version: &[u8], encoding: Option<&[u8]>, standalone: Option<&[u8]>) -> Result<(), DeError> {
+        self.writer
+            .write_event(Event::Decl(BytesDecl::new(version, encoding, standalone)))?;
         Ok(())
     }
 }
@@ -331,8 +328,20 @@ impl<'r, 'w, W: Write> ser::Serializer for &'w mut Serializer<'r, W> {
     ) -> Result<Self::SerializeStruct, DeError> {
         let mut element_name = self.root_tag.unwrap_or(name);
         if element_name.starts_with(DOCUMENT_PREFIX) {
-            self.write_declaration()?;
-            element_name = name.split_at(DOCUMENT_PREFIX.len()).1;
+            let mut info = name.split_at(DOCUMENT_PREFIX.len()).1.split(',');
+            element_name = info.next().unwrap();
+            let version = info.next().unwrap().as_bytes();
+            let encoding = match info.next() {
+                Some(x) if !x.is_empty() => Some(x.as_bytes()),
+                _ => None
+            };
+            let standalone =    match info.next() {
+                Some(x) if !x.is_empty() => Some(x.as_bytes()),
+                _ => None
+            };
+
+
+            self.write_declaration(version, encoding, standalone)?;
         }
         Ok(Struct::new(self, element_name))
     }
