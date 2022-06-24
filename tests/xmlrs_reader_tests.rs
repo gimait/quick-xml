@@ -1,8 +1,6 @@
-extern crate quick_xml;
-
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::{Reader, Result};
-use std::borrow::Cow;
+use quick_xml::name::{QName, ResolveResult};
+use quick_xml::{Decoder, Reader, Result};
 use std::str::from_utf8;
 
 #[test]
@@ -163,7 +161,7 @@ fn sample_ns_short() {
 fn eof_1() {
     test(
         r#"<?xml"#,
-        r#"Error: Unexpected EOF during reading XmlDecl."#,
+        r#"Error: Unexpected EOF during reading XmlDecl"#,
         true,
     );
 }
@@ -172,7 +170,7 @@ fn eof_1() {
 fn bad_1() {
     test(
         r#"<?xml&.,"#,
-        r#"1:6 Error: Unexpected EOF during reading XmlDecl."#,
+        r#"1:6 Error: Unexpected EOF during reading XmlDecl"#,
         true,
     );
 }
@@ -191,6 +189,17 @@ fn dashes_in_comments() {
         r#"<!-- comment ---><hello/>"#,
         r#"
         |Error: Unexpected token '--'
+        "#,
+        true,
+    );
+
+    // Canary test for correct comments
+    test(
+        r#"<!-- comment --><hello/>"#,
+        r#"
+        |Comment( comment )
+        |EmptyElement(hello)
+        |EndDocument
         "#,
         true,
     );
@@ -218,8 +227,8 @@ fn issue_83_duplicate_attributes() {
         r#"<hello><some-tag a='10' a="20"/></hello>"#,
         "
             |StartElement(hello)
-            |1:30 EmptyElement(some-tag, attr-error: error while parsing \
-                  attribute at position 16: Duplicate attribute at position 9 and 16)
+            |1:30 EmptyElement(some-tag, attr-error: \
+                  position 16: duplicated attribute, previous declaration at position 9)
             |EndElement(hello)
             |EndDocument
         ",
@@ -247,9 +256,7 @@ fn issue_98_cdata_ending_with_right_bracket() {
         r#"<hello><![CDATA[Foo [Bar]]]></hello>"#,
         r#"
             |StartElement(hello)
-            |Characters()
             |CData(Foo [Bar])
-            |Characters()
             |EndElement(hello)
             |EndDocument
         "#,
@@ -296,9 +303,7 @@ fn issue_105_unexpected_double_dash() {
         r#"<hello><![CDATA[--]]></hello>"#,
         r#"
             |StartElement(hello)
-            |Characters()
             |CData(--)
-            |Characters()
             |EndElement(hello)
             |EndDocument
         "#,
@@ -349,10 +354,12 @@ fn default_namespace_applies_to_end_elem() {
     );
 }
 
+#[track_caller]
 fn test(input: &str, output: &str, is_short: bool) {
     test_bytes(input.as_bytes(), output.as_bytes(), is_short);
 }
 
+#[track_caller]
 fn test_bytes(input: &[u8], output: &[u8], is_short: bool) {
     // Normalize newlines on Windows to just \n, which is what the reader and
     // writer use.
@@ -370,15 +377,10 @@ fn test_bytes(input: &[u8], output: &[u8], is_short: bool) {
     let mut buf = Vec::new();
     let mut ns_buffer = Vec::new();
 
-    if !is_short {
-        // discard first whitespace
-        reader.read_event(&mut buf).unwrap();
-    }
-
     loop {
         buf.clear();
         let event = reader.read_namespaced_event(&mut buf, &mut ns_buffer);
-        let line = xmlrs_display(&event, &reader);
+        let line = xmlrs_display(event, reader.decoder());
         if let Some((n, spec)) = spec_lines.next() {
             if spec.trim() == "EndDocument" {
                 break;
@@ -417,10 +419,12 @@ fn test_bytes(input: &[u8], output: &[u8], is_short: bool) {
     }
 }
 
-fn namespace_name(n: &Option<&[u8]>, name: &[u8]) -> String {
-    match *n {
-        Some(n) => format!("{{{}}}{}", from_utf8(n).unwrap(), from_utf8(name).unwrap()),
-        None => from_utf8(name).unwrap().to_owned(),
+fn namespace_name(n: ResolveResult, name: QName, decoder: Decoder) -> String {
+    let name = decoder.decode(name.as_ref()).unwrap();
+    match n {
+        // Produces string '{namespace}prefixed_name'
+        ResolveResult::Bound(n) => format!("{{{}}}{}", from_utf8(n.as_ref()).unwrap(), name),
+        _ => name.to_string(),
     }
 }
 
@@ -429,10 +433,10 @@ fn make_attrs(e: &BytesStart) -> ::std::result::Result<String, String> {
     for a in e.attributes() {
         match a {
             Ok(a) => {
-                if a.key.len() < 5 || !a.key.starts_with(b"xmlns") {
+                if a.key.as_namespace_binding().is_none() {
                     atts.push(format!(
                         "{}=\"{}\"",
-                        from_utf8(a.key).unwrap(),
+                        from_utf8(a.key.as_ref()).unwrap(),
                         from_utf8(&*a.unescaped_value().unwrap()).unwrap()
                     ));
                 }
@@ -443,46 +447,33 @@ fn make_attrs(e: &BytesStart) -> ::std::result::Result<String, String> {
     Ok(atts.join(", "))
 }
 
-// FIXME: The public API differs based on the "encoding" feature
-fn decode<'a>(text: &'a [u8], reader: &Reader<&[u8]>) -> Cow<'a, str> {
-    #[cfg(feature = "encoding")]
-    let decoded = reader.decode(text);
-
-    #[cfg(not(feature = "encoding"))]
-    let decoded = Cow::Borrowed(reader.decode(text).unwrap());
-
-    decoded
-}
-
-fn xmlrs_display(opt_event: &Result<(Option<&[u8]>, Event)>, reader: &Reader<&[u8]>) -> String {
+fn xmlrs_display(opt_event: Result<(ResolveResult, Event)>, decoder: Decoder) -> String {
     match opt_event {
-        Ok((ref n, Event::Start(ref e))) => {
-            let name = namespace_name(n, decode(e.name(), reader).as_bytes());
+        Ok((_, Event::StartText(_))) => "StartText".to_string(),
+        Ok((n, Event::Start(ref e))) => {
+            let name = namespace_name(n, e.name(), decoder);
             match make_attrs(e) {
                 Ok(ref attrs) if attrs.is_empty() => format!("StartElement({})", &name),
                 Ok(ref attrs) => format!("StartElement({} [{}])", &name, &attrs),
                 Err(e) => format!("StartElement({}, attr-error: {})", &name, &e),
             }
         }
-        Ok((ref n, Event::Empty(ref e))) => {
-            let name = namespace_name(n, decode(e.name(), reader).as_bytes());
+        Ok((n, Event::Empty(ref e))) => {
+            let name = namespace_name(n, e.name(), decoder);
             match make_attrs(e) {
                 Ok(ref attrs) if attrs.is_empty() => format!("EmptyElement({})", &name),
                 Ok(ref attrs) => format!("EmptyElement({} [{}])", &name, &attrs),
                 Err(e) => format!("EmptyElement({}, attr-error: {})", &name, &e),
             }
         }
-        Ok((ref n, Event::End(ref e))) => {
-            let name = namespace_name(n, decode(e.name(), reader).as_bytes());
+        Ok((n, Event::End(ref e))) => {
+            let name = namespace_name(n, e.name(), decoder);
             format!("EndElement({})", name)
         }
         Ok((_, Event::Comment(ref e))) => format!("Comment({})", from_utf8(e).unwrap()),
         Ok((_, Event::CData(ref e))) => format!("CData({})", from_utf8(e).unwrap()),
         Ok((_, Event::Text(ref e))) => match e.unescaped() {
-            Ok(c) => match from_utf8(decode(&*c, reader).as_bytes()) {
-                Ok(c) => format!("Characters({})", c),
-                Err(ref err) => format!("InvalidUtf8({:?}; {})", e.escaped(), err),
-            },
+            Ok(c) => format!("Characters({})", decoder.decode(c.as_ref()).unwrap()),
             Err(ref err) => format!("FailedUnescape({:?}; {})", e.escaped(), err),
         },
         Ok((_, Event::Decl(ref e))) => {

@@ -7,9 +7,6 @@
 //! * the regex in this example is simple but brittle;
 //! * it does not support the use of entities in entity declaration.
 
-extern crate quick_xml;
-extern crate regex;
-
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::bytes::Regex;
@@ -40,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     custom_entities.insert(cap[1].to_vec(), cap[2].to_vec());
                 }
             }
-            Ok(Event::Start(ref e)) => match e.name() {
+            Ok(Event::Start(ref e)) => match e.name().as_ref() {
                 b"test" => println!(
                     "attributes values: {:?}",
                     e.attributes()

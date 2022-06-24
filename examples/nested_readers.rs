@@ -1,6 +1,7 @@
-extern crate quick_xml;
+use pretty_assertions::assert_eq;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+
 // a structure to capture the rows we've extracted
 // from a ECMA-376 table in document.xml
 #[derive(Debug, Clone)]
@@ -20,7 +21,7 @@ fn main() -> Result<(), quick_xml::Error> {
     let mut found_tables = Vec::new();
     loop {
         match reader.read_event(&mut buf)? {
-            Event::Start(element) => match element.name() {
+            Event::Start(element) => match element.name().as_ref() {
                 b"w:tbl" => {
                     count += 1;
                     let mut stats = TableStat {
@@ -33,19 +34,21 @@ fn main() -> Result<(), quick_xml::Error> {
                     loop {
                         skip_buf.clear();
                         match reader.read_event(&mut skip_buf)? {
-                            Event::Start(element) => match element.name() {
+                            Event::Start(element) => match element.name().as_ref() {
                                 b"w:tr" => {
                                     stats.rows.push(vec![]);
                                     row_index = stats.rows.len() - 1;
                                 }
                                 b"w:tc" => {
-                                    stats.rows[row_index]
-                                        .push(String::from_utf8(element.name().to_vec()).unwrap());
+                                    stats.rows[row_index].push(
+                                        String::from_utf8(element.name().as_ref().to_vec())
+                                            .unwrap(),
+                                    );
                                 }
                                 _ => {}
                             },
                             Event::End(element) => {
-                                if element.name() == b"w:tbl" {
+                                if element.name().as_ref() == b"w:tbl" {
                                     found_tables.push(stats);
                                     break;
                                 }
@@ -64,10 +67,12 @@ fn main() -> Result<(), quick_xml::Error> {
     assert_eq!(found_tables.len(), 2);
     // pretty print the table
     println!("{:#?}", found_tables);
+    assert_eq!(found_tables[0].index, 2);
     assert_eq!(found_tables[0].rows.len(), 2);
     assert_eq!(found_tables[0].rows[0].len(), 4);
     assert_eq!(found_tables[0].rows[1].len(), 4);
 
+    assert_eq!(found_tables[1].index, 2);
     assert_eq!(found_tables[1].rows.len(), 2);
     assert_eq!(found_tables[1].rows[0].len(), 4);
     assert_eq!(found_tables[1].rows[1].len(), 4);

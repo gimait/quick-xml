@@ -23,8 +23,7 @@ pub fn to_writer<W: Write, S: Serialize>(writer: W, value: &S) -> Result<(), DeE
 pub fn to_string<S: Serialize>(value: &S) -> Result<String, DeError> {
     let mut writer = Vec::new();
     to_writer(&mut writer, value)?;
-    let s = String::from_utf8(writer).map_err(|e| crate::errors::Error::Utf8(e.utf8_error()))?;
-    Ok(s)
+    Ok(String::from_utf8(writer)?)
 }
 
 /// A Serializer
@@ -51,6 +50,7 @@ impl<'r, W: Write> Serializer<'r, W> {
     /// When serializing a primitive type, only its representation will be written:
     ///
     /// ```edition2018
+    /// # use pretty_assertions::assert_eq;
     /// # use serde::Serialize;
     /// use quick_xml::Writer;
     /// # use quick_xml::se::Serializer;
@@ -67,6 +67,7 @@ impl<'r, W: Write> Serializer<'r, W> {
     /// is used as tag name of root(s) element(s):
     ///
     /// ```edition2018
+    /// # use pretty_assertions::assert_eq;
     /// # use serde::Serialize;
     /// use quick_xml::Writer;
     /// use quick_xml::se::Serializer;
@@ -360,6 +361,7 @@ impl<'r, 'w, W: Write> ser::Serializer for &'w mut Serializer<'r, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use serde::ser::SerializeMap;
     use serde::{Serialize, Serializer as SerSerializer};
 
@@ -664,6 +666,7 @@ mod tests {
 
         mod externally_tagged {
             use super::*;
+            use pretty_assertions::assert_eq;
 
             #[derive(Serialize)]
             enum Node {
@@ -817,6 +820,7 @@ mod tests {
 
         mod internally_tagged {
             use super::*;
+            use pretty_assertions::assert_eq;
 
             #[derive(Serialize)]
             #[serde(tag = "tag")]
@@ -943,6 +947,7 @@ mod tests {
 
         mod adjacently_tagged {
             use super::*;
+            use pretty_assertions::assert_eq;
 
             #[derive(Serialize)]
             #[serde(tag = "tag", content = "content")]
@@ -1083,6 +1088,7 @@ mod tests {
 
         mod untagged {
             use super::*;
+            use pretty_assertions::assert_eq;
 
             #[derive(Serialize)]
             #[serde(untagged)]

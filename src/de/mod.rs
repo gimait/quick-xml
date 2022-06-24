@@ -8,10 +8,8 @@
 //! // Cargo.toml
 //! // [dependencies]
 //! // serde = { version = "1.0", features = [ "derive" ] }
-//! // quick-xml = { version = "0.21", features = [ "serialize" ] }
-//! extern crate serde;
-//! extern crate quick_xml;
-//!
+//! // quick-xml = { version = "0.22", features = [ "serialize" ] }
+//! # use pretty_assertions::assert_eq;
 //! use serde::Deserialize;
 //! use quick_xml::de::{from_str, DeError};
 //!
@@ -107,24 +105,134 @@
 //! }
 //! ```
 
-#[cfg(test)]
-mod byte_buf;
+// Macros should be defined before the modules that using them
+// Also, macros should be imported before using them
+use serde::serde_if_integer128;
+
+macro_rules! deserialize_type {
+    ($deserialize:ident => $visit:ident, $($mut:tt)?) => {
+        fn $deserialize<V>($($mut)? self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            // No need to unescape because valid integer representations cannot be escaped
+            let text = self.next_text(false)?;
+            let string = text.decode(self.decoder())?;
+            visitor.$visit(string.parse()?)
+        }
+    };
+}
+
+/// Implement deserialization methods for scalar types, such as numbers, strings,
+/// byte arrays, booleans and identifiers.
+macro_rules! deserialize_primitives {
+    ($($mut:tt)?) => {
+        deserialize_type!(deserialize_i8 => visit_i8, $($mut)?);
+        deserialize_type!(deserialize_i16 => visit_i16, $($mut)?);
+        deserialize_type!(deserialize_i32 => visit_i32, $($mut)?);
+        deserialize_type!(deserialize_i64 => visit_i64, $($mut)?);
+
+        deserialize_type!(deserialize_u8 => visit_u8, $($mut)?);
+        deserialize_type!(deserialize_u16 => visit_u16, $($mut)?);
+        deserialize_type!(deserialize_u32 => visit_u32, $($mut)?);
+        deserialize_type!(deserialize_u64 => visit_u64, $($mut)?);
+
+        serde_if_integer128! {
+            deserialize_type!(deserialize_i128 => visit_i128, $($mut)?);
+            deserialize_type!(deserialize_u128 => visit_u128, $($mut)?);
+        }
+
+        deserialize_type!(deserialize_f32 => visit_f32, $($mut)?);
+        deserialize_type!(deserialize_f64 => visit_f64, $($mut)?);
+
+        fn deserialize_bool<V>($($mut)? self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            // No need to unescape because valid boolean representations cannot be escaped
+            let text = self.next_text(false)?;
+
+            deserialize_bool(text.as_ref(), self.decoder(), visitor)
+        }
+
+        /// Representation of owned strings the same as [non-owned](#method.deserialize_str).
+        fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            self.deserialize_str(visitor)
+        }
+
+        /// Character represented as [strings](#method.deserialize_str).
+        fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            self.deserialize_str(visitor)
+        }
+
+        fn deserialize_str<V>($($mut)? self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            let text = self.next_text(true)?;
+            let string = text.decode(self.decoder())?;
+            match string {
+                Cow::Borrowed(string) => visitor.visit_borrowed_str(string),
+                Cow::Owned(string) => visitor.visit_string(string),
+            }
+        }
+
+        fn deserialize_bytes<V>($($mut)? self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            // No need to unescape because bytes gives access to the raw XML input
+            let text = self.next_text(false)?;
+            visitor.visit_bytes(&text)
+        }
+
+        fn deserialize_byte_buf<V>($($mut)? self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            // No need to unescape because bytes gives access to the raw XML input
+            let text = self.next_text(false)?;
+            let value = text.into_inner().into_owned();
+            visitor.visit_byte_buf(value)
+        }
+
+        /// Identifiers represented as [strings](#method.deserialize_str).
+        fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, DeError>
+        where
+            V: Visitor<'de>,
+        {
+            self.deserialize_str(visitor)
+        }
+    };
+}
+
 mod escape;
 mod map;
 mod seq;
+mod simple_type;
 mod var;
 
 pub use crate::errors::serialize::DeError;
 use crate::{
     errors::Error,
-    events::{BytesEnd, BytesStart, BytesText, Event},
+    events::{BytesCData, BytesEnd, BytesStart, BytesText, Event},
+    name::QName,
     reader::Decoder,
     Reader,
 };
 use serde::de::{self, Deserialize, DeserializeOwned, Visitor};
-use serde::serde_if_integer128;
 use std::borrow::Cow;
+#[cfg(feature = "overlapped-lists")]
+use std::collections::VecDeque;
 use std::io::BufRead;
+#[cfg(feature = "overlapped-lists")]
+use std::num::NonZeroUsize;
 
 pub(crate) const INNER_VALUE: &str = "$value";
 pub(crate) const STRUCT_TAG: &str = "$struct";
@@ -143,90 +251,113 @@ pub enum DeEvent<'a> {
     Text(BytesText<'a>),
     /// Unescaped character data between `Start` and `End` element,
     /// stored in `<![CDATA[...]]>`.
-    CData(BytesText<'a>),
+    CData(BytesCData<'a>),
     /// End of XML document.
     Eof,
 }
 
-/// An xml deserializer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// A structure that deserializes XML into Rust values.
 pub struct Deserializer<'de, R>
 where
-    R: BorrowingReader<'de>,
+    R: XmlRead<'de>,
 {
+    /// An XML reader that streams events into this deserializer
     reader: R,
-    peek: Option<DeEvent<'de>>,
-    /// Special sing that deserialized struct have a field with the special
-    /// name (see constant `INNER_VALUE`). That field should be deserialized
-    /// from the text content of the XML node:
+
+    /// When deserializing sequences sometimes we have to skip unwanted events.
+    /// That events should be stored and then replayed. This is a replay buffer,
+    /// that streams events while not empty. When it exhausted, events will
+    /// requested from [`Self::reader`].
+    #[cfg(feature = "overlapped-lists")]
+    read: VecDeque<DeEvent<'de>>,
+    /// When deserializing sequences sometimes we have to skip events, because XML
+    /// is tolerant to elements order and even if in the XSD order is strictly
+    /// specified (using `xs:sequence`) most of XML parsers allows order violations.
+    /// That means, that elements, forming a sequence, could be overlapped with
+    /// other elements, do not related to that sequence.
     ///
-    /// ```xml
-    /// <tag>value for INNER_VALUE field<tag>
-    /// ```
-    has_value_field: bool,
+    /// In order to support this, deserializer will scan events and skip unwanted
+    /// events, store them here. After call [`Self::start_replay()`] all events
+    /// moved from this to [`Self::read`].
+    #[cfg(feature = "overlapped-lists")]
+    write: VecDeque<DeEvent<'de>>,
+    /// Maximum number of events that can be skipped when processing sequences
+    /// that occur out-of-order. This field is used to prevent potential
+    /// denial-of-service (DoS) attacks which could cause infinite memory
+    /// consumption when parsing a very large amount of XML into a sequence field.
+    #[cfg(feature = "overlapped-lists")]
+    limit: Option<NonZeroUsize>,
+
+    #[cfg(not(feature = "overlapped-lists"))]
+    peek: Option<DeEvent<'de>>,
 }
 
-/// Deserialize an instance of type T from a string of XML text.
+/// Deserialize an instance of type `T` from a string of XML text.
 pub fn from_str<'de, T>(s: &'de str) -> Result<T, DeError>
 where
     T: Deserialize<'de>,
 {
-    from_bytes(s.as_bytes())
+    from_slice(s.as_bytes())
 }
 
-/// Deserialize a xml slice of bytes
+/// Deserialize an instance of type `T` from bytes of XML text.
+#[deprecated = "Use `from_slice` instead"]
 pub fn from_bytes<'de, T>(s: &'de [u8]) -> Result<T, DeError>
 where
     T: Deserialize<'de>,
 {
-    let mut de = Deserializer::from_bytes(s);
+    from_slice(s)
+}
+
+/// Deserialize an instance of type `T` from bytes of XML text.
+pub fn from_slice<'de, T>(s: &'de [u8]) -> Result<T, DeError>
+where
+    T: Deserialize<'de>,
+{
+    let mut de = Deserializer::from_slice(s);
     T::deserialize(&mut de)
 }
 
-/// Deserialize an instance of type T from bytes of XML text.
-pub fn from_slice<T>(b: &[u8]) -> Result<T, DeError>
-where
-    T: DeserializeOwned,
-{
-    from_reader(b)
-}
-
-/// Deserialize from a reader
+/// Deserialize from a reader. This method will do internal copies of data
+/// readed from `reader`. If you want have a `&[u8]` or `&str` input and want
+/// to borrow as much as possible, use [`from_slice`] or [`from_str`]
 pub fn from_reader<R, T>(reader: R) -> Result<T, DeError>
 where
     R: BufRead,
     T: DeserializeOwned,
 {
-    let mut reader = Reader::from_reader(reader);
-    reader
-        .expand_empty_elements(true)
-        .check_end_names(true)
-        .trim_text(true);
-    let mut de = Deserializer::from_borrowing_reader(IoReader {
-        reader,
-        buf: Vec::new(),
-    });
+    let mut de = Deserializer::from_reader(reader);
     T::deserialize(&mut de)
 }
 
 // TODO: According to the https://www.w3.org/TR/xmlschema-2/#boolean,
 // valid boolean representations are only "true", "false", "1", and "0"
+fn str2bool<'de, V>(value: &str, visitor: V) -> Result<V::Value, DeError>
+where
+    V: de::Visitor<'de>,
+{
+    match value {
+        "true" | "1" | "True" | "TRUE" | "t" | "Yes" | "YES" | "yes" | "y" => {
+            visitor.visit_bool(true)
+        }
+        "false" | "0" | "False" | "FALSE" | "f" | "No" | "NO" | "no" | "n" => {
+            visitor.visit_bool(false)
+        }
+        _ => Err(DeError::InvalidBoolean(value.into())),
+    }
+}
+
 fn deserialize_bool<'de, V>(value: &[u8], decoder: Decoder, visitor: V) -> Result<V::Value, DeError>
 where
     V: Visitor<'de>,
 {
     #[cfg(feature = "encoding")]
     {
-        let value = decoder.decode(value);
+        let value = decoder.decode(value)?;
         // No need to unescape because valid boolean representations cannot be escaped
-        match value.as_ref() {
-            "true" | "1" | "True" | "TRUE" | "t" | "Yes" | "YES" | "yes" | "y" => {
-                visitor.visit_bool(true)
-            }
-            "false" | "0" | "False" | "FALSE" | "f" | "No" | "NO" | "no" | "n" => {
-                visitor.visit_bool(false)
-            }
-            _ => Err(DeError::InvalidBoolean(value.into())),
-        }
+        str2bool(value.as_ref(), visitor)
     }
 
     #[cfg(not(feature = "encoding"))]
@@ -246,25 +377,119 @@ where
 
 impl<'de, R> Deserializer<'de, R>
 where
-    R: BorrowingReader<'de>,
+    R: XmlRead<'de>,
 {
-    /// Get a new deserializer
+    /// Create an XML deserializer from one of the possible quick_xml input sources.
+    ///
+    /// Typically it is more convenient to use one of these methods instead:
+    ///
+    ///  - [`Deserializer::from_str`]
+    ///  - [`Deserializer::from_slice`]
+    ///  - [`Deserializer::from_reader`]
     pub fn new(reader: R) -> Self {
         Deserializer {
             reader,
+
+            #[cfg(feature = "overlapped-lists")]
+            read: VecDeque::new(),
+            #[cfg(feature = "overlapped-lists")]
+            write: VecDeque::new(),
+            #[cfg(feature = "overlapped-lists")]
+            limit: None,
+
+            #[cfg(not(feature = "overlapped-lists"))]
             peek: None,
-            has_value_field: false,
         }
     }
 
     /// Get a new deserializer from a regular BufRead
+    #[deprecated = "Use `Deserializer::new` instead"]
     pub fn from_borrowing_reader(reader: R) -> Self {
         Self::new(reader)
     }
 
+    /// Set the maximum number of events that could be skipped during deserialization
+    /// of sequences.
+    ///
+    /// If `<element>` contains more than specified nested elements, `#text` or
+    /// CDATA nodes, then [`DeError::TooManyEvents`] will be returned during
+    /// deserialization of sequence field (any type that uses [`deserialize_seq`]
+    /// for the deserialization, for example, `Vec<T>`).
+    ///
+    /// This method can be used to prevent a [DoS] attack and infinite memory
+    /// consumption when parsing a very large XML to a sequence field.
+    ///
+    /// It is strongly recommended to set limit to some value when you parse data
+    /// from untrusted sources. You should choose a value that your typical XMLs
+    /// can have _between_ different elements that corresponds to the same sequence.
+    ///
+    /// # Examples
+    ///
+    /// Let's imagine, that we deserialize such structure:
+    /// ```
+    /// struct List {
+    ///   item: Vec<()>,
+    /// }
+    /// ```
+    ///
+    /// The XML that we try to parse look like this:
+    /// ```xml
+    /// <any-name>
+    ///   <item/>
+    ///   <!-- Bufferization starts at this point -->
+    ///   <another-item>
+    ///     <some-element>with text</some-element>
+    ///     <yet-another-element/>
+    ///   </another-item>
+    ///   <!-- Buffer will be emptied at this point; 7 events were buffered -->
+    ///   <item/>
+    ///   <!-- There is nothing to buffer, because elements follows each other -->
+    ///   <item/>
+    /// </any-name>
+    /// ```
+    ///
+    /// There, when we deserialize the `item` field, we need to buffer 7 events,
+    /// before we can deserialize the second `<item/>`:
+    ///
+    /// - `<another-item>`
+    /// - `<some-element>`
+    /// - `#text(with text)`
+    /// - `</some-element>`
+    /// - `<yet-another-element/>` (virtual start event)
+    /// - `<yet-another-element/>` (vitrual end event)
+    /// - `</another-item>`
+    ///
+    /// Note, that `<yet-another-element/>` internally represented as 2 events:
+    /// one for the start tag and one for the end tag. In the future this can be
+    /// eliminated, but for now we use [auto-expanding feature] of a reader,
+    /// because this simplifies deserializer code.
+    ///
+    /// [`deserialize_seq`]: serde::Deserializer::deserialize_seq
+    /// [DoS]: https://en.wikipedia.org/wiki/Denial-of-service_attack
+    /// [auto-expanding feature]: Reader::expand_empty_elements
+    #[cfg(feature = "overlapped-lists")]
+    pub fn event_buffer_size(&mut self, limit: Option<NonZeroUsize>) -> &mut Self {
+        self.limit = limit;
+        self
+    }
+
+    #[cfg(feature = "overlapped-lists")]
+    fn peek(&mut self) -> Result<&DeEvent<'de>, DeError> {
+        if self.read.is_empty() {
+            self.read.push_front(self.reader.next()?);
+        }
+        if let Some(event) = self.read.front() {
+            return Ok(&event);
+        }
+        // SAFETY: `self.read` was filled in the code above.
+        // NOTE: Can be replaced with `unsafe { std::hint::unreachable_unchecked() }`
+        // if unsafe code will be allowed
+        unreachable!()
+    }
+    #[cfg(not(feature = "overlapped-lists"))]
     fn peek(&mut self) -> Result<&DeEvent<'de>, DeError> {
         if self.peek.is_none() {
-            self.peek = Some(self.next()?);
+            self.peek = Some(self.reader.next()?);
         }
         match self.peek.as_ref() {
             Some(v) => Ok(v),
@@ -277,10 +502,79 @@ where
     }
 
     fn next(&mut self) -> Result<DeEvent<'de>, DeError> {
+        // Replay skipped or peeked events
+        #[cfg(feature = "overlapped-lists")]
+        if let Some(event) = self.read.pop_front() {
+            return Ok(event);
+        }
+        #[cfg(not(feature = "overlapped-lists"))]
         if let Some(e) = self.peek.take() {
             return Ok(e);
         }
         self.reader.next()
+    }
+
+    /// Extracts XML tree of events from and stores them in the skipped events
+    /// buffer from which they can be retrieved later. You MUST call
+    /// [`Self::start_replay()`] after calling this to give access to the skipped
+    /// events and release internal buffers.
+    #[cfg(feature = "overlapped-lists")]
+    fn skip(&mut self) -> Result<(), DeError> {
+        let event = self.next()?;
+        self.skip_event(event)?;
+        match self.write.back() {
+            // Skip all subtree, if we skip a start event
+            Some(DeEvent::Start(e)) => {
+                let end = e.name().as_ref().to_owned();
+                let mut depth = 0;
+                loop {
+                    let event = self.next()?;
+                    match event {
+                        DeEvent::Start(ref e) if e.name().as_ref() == end => {
+                            self.skip_event(event)?;
+                            depth += 1;
+                        }
+                        DeEvent::End(ref e) if e.name().as_ref() == end => {
+                            self.skip_event(event)?;
+                            if depth == 0 {
+                                return Ok(());
+                            }
+                            depth -= 1;
+                        }
+                        _ => self.skip_event(event)?,
+                    }
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "overlapped-lists")]
+    #[inline]
+    fn skip_event(&mut self, event: DeEvent<'de>) -> Result<(), DeError> {
+        if let Some(max) = self.limit {
+            if self.write.len() >= max.get() {
+                return Err(DeError::TooManyEvents(max));
+            }
+        }
+        self.write.push_back(event);
+        Ok(())
+    }
+
+    /// Moves all buffered events to the end of [`Self::write`] buffer and swaps
+    /// read and write buffers.
+    ///
+    /// After calling this method, [`Self::peek()`] and [`Self::next()`] starts
+    /// return events that was skipped previously by calling [`Self::skip()`],
+    /// and only when all that events will be consumed, the deserializer starts
+    /// to drain events from underlying reader.
+    ///
+    /// This method MUST be called if any number of [`Self::skip()`] was called
+    /// after [`Self::new()`] or `start_replay()` or you'll lost events.
+    #[cfg(feature = "overlapped-lists")]
+    fn start_replay(&mut self) {
+        self.write.append(&mut self.read);
+        std::mem::swap(&mut self.read, &mut self.write);
     }
 
     fn next_start(&mut self) -> Result<Option<BytesStart<'de>>, DeError> {
@@ -288,47 +582,124 @@ where
             let e = self.next()?;
             match e {
                 DeEvent::Start(e) => return Ok(Some(e)),
-                DeEvent::End(_) => return Err(DeError::End),
+                DeEvent::End(e) => {
+                    return Err(DeError::UnexpectedEnd(e.name().as_ref().to_owned()))
+                }
                 DeEvent::Eof => return Ok(None),
                 _ => (), // ignore texts
             }
         }
     }
 
-    /// Consumes an one XML element, returns associated text or empty string:
+    #[inline]
+    fn next_text(&mut self, unescape: bool) -> Result<BytesCData<'de>, DeError> {
+        self.next_text_impl(unescape, true)
+    }
+
+    /// Consumes a one XML element or an XML tree, returns associated text or
+    /// an empty string.
     ///
-    /// |XML                  |Result     |Comments                    |
-    /// |---------------------|-----------|----------------------------|
-    /// |`<tag ...>text</tag>`|`text`     |Complete tag consumed       |
-    /// |`<tag/>`             |empty slice|Virtual end tag not consumed|
-    /// |`</tag>`             |empty slice|Not consumed                |
-    fn next_text(&mut self) -> Result<BytesText<'de>, DeError> {
+    /// If `allow_start` is `false`, then only one event is consumed. If that
+    /// event is [`DeEvent::Start`], then [`DeError::UnexpectedStart`] is returned.
+    ///
+    /// If `allow_start` is `true`, then first text of CDATA event inside it is
+    /// returned and all other content is skipped until corresponding end tag
+    /// will be consumed.
+    ///
+    /// # Handling events
+    ///
+    /// The table below shows how events is handled by this method:
+    ///
+    /// |Event             |XML                        |Handling
+    /// |------------------|---------------------------|----------------------------------------
+    /// |[`DeEvent::Start`]|`<tag>...</tag>`           |if `allow_start == true`, result determined by the second table, otherwise emits [`UnexpectedStart("tag")`](DeError::UnexpectedStart)
+    /// |[`DeEvent::End`]  |`</any-tag>`               |Emits [`UnexpectedEnd("any-tag")`](DeError::UnexpectedEnd)
+    /// |[`DeEvent::Text`] |`text content`             |Unescapes `text content` and returns it
+    /// |[`DeEvent::CData`]|`<![CDATA[cdata content]]>`|Returns `cdata content` unchanged
+    /// |[`DeEvent::Eof`]  |                           |Emits [`UnexpectedEof`](DeError::UnexpectedEof)
+    ///
+    /// Second event, consumed if [`DeEvent::Start`] was received and `allow_start == true`:
+    ///
+    /// |Event             |XML                        |Handling
+    /// |------------------|---------------------------|----------------------------------------------------------------------------------
+    /// |[`DeEvent::Start`]|`<any-tag>...</any-tag>`   |Emits [`UnexpectedStart("any-tag")`](DeError::UnexpectedStart)
+    /// |[`DeEvent::End`]  |`</tag>`                   |Returns an empty slice, if close tag matched the open one
+    /// |[`DeEvent::End`]  |`</any-tag>`               |Emits [`UnexpectedEnd("any-tag")`](DeError::UnexpectedEnd)
+    /// |[`DeEvent::Text`] |`text content`             |Unescapes `text content` and returns it, consumes events up to `</tag>`
+    /// |[`DeEvent::CData`]|`<![CDATA[cdata content]]>`|Returns `cdata content` unchanged, consumes events up to `</tag>`
+    /// |[`DeEvent::Eof`]  |                           |Emits [`UnexpectedEof`](DeError::UnexpectedEof)
+    fn next_text_impl(
+        &mut self,
+        unescape: bool,
+        allow_start: bool,
+    ) -> Result<BytesCData<'de>, DeError> {
         match self.next()? {
-            DeEvent::Text(e) | DeEvent::CData(e) => Ok(e),
-            DeEvent::Eof => Err(DeError::Eof),
-            DeEvent::Start(e) => {
+            DeEvent::Text(e) if unescape => e.unescape().map_err(Into::into),
+            DeEvent::Text(e) => Ok(BytesCData::new(e.into_inner())),
+            DeEvent::CData(e) => Ok(e),
+            DeEvent::Start(e) if allow_start => {
                 // allow one nested level
                 let inner = self.next()?;
                 let t = match inner {
-                    DeEvent::Text(t) | DeEvent::CData(t) => t,
-                    DeEvent::Start(_) => return Err(DeError::Start),
-                    DeEvent::End(end) if end.name() == e.name() => {
-                        return Ok(BytesText::from_escaped(&[] as &[u8]));
+                    DeEvent::Text(t) if unescape => t.unescape()?,
+                    DeEvent::Text(t) => BytesCData::new(t.into_inner()),
+                    DeEvent::CData(t) => t,
+                    DeEvent::Start(s) => {
+                        return Err(DeError::UnexpectedStart(s.name().as_ref().to_owned()))
                     }
-                    DeEvent::End(_) => return Err(DeError::End),
-                    DeEvent::Eof => return Err(DeError::Eof),
+                    // We can get End event in case of `<tag></tag>` or `<tag/>` input
+                    // Return empty text in that case
+                    DeEvent::End(end) if end.name() == e.name() => {
+                        return Ok(BytesCData::new(&[] as &[u8]));
+                    }
+                    DeEvent::End(end) => {
+                        return Err(DeError::UnexpectedEnd(end.name().as_ref().to_owned()))
+                    }
+                    DeEvent::Eof => return Err(DeError::UnexpectedEof),
                 };
                 self.read_to_end(e.name())?;
                 Ok(t)
             }
-            DeEvent::End(e) => {
-                self.peek = Some(DeEvent::End(e));
-                Ok(BytesText::from_escaped(&[] as &[u8]))
-            }
+            DeEvent::Start(e) => Err(DeError::UnexpectedStart(e.name().as_ref().to_owned())),
+            DeEvent::End(e) => Err(DeError::UnexpectedEnd(e.name().as_ref().to_owned())),
+            DeEvent::Eof => Err(DeError::UnexpectedEof),
         }
     }
 
-    fn read_to_end(&mut self, name: &[u8]) -> Result<(), DeError> {
+    /// Returns a decoder, used inside `deserialize_primitives!()`
+    #[inline]
+    fn decoder(&self) -> Decoder {
+        self.reader.decoder()
+    }
+
+    /// Drops all events until event with [name](BytesEnd::name()) `name` won't be
+    /// dropped. This method should be called after [`Self::next()`]
+    #[cfg(feature = "overlapped-lists")]
+    fn read_to_end(&mut self, name: QName) -> Result<(), DeError> {
+        let mut depth = 0;
+        loop {
+            match self.read.pop_front() {
+                Some(DeEvent::Start(e)) if e.name() == name => {
+                    depth += 1;
+                }
+                Some(DeEvent::End(e)) if e.name() == name => {
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                    depth -= 1;
+                }
+
+                // Drop all other skipped events
+                Some(_) => continue,
+
+                // If we do not have skipped events, use effective reading that will
+                // not allocate memory for events
+                None => return self.reader.read_to_end(name),
+            }
+        }
+    }
+    #[cfg(not(feature = "overlapped-lists"))]
+    fn read_to_end(&mut self, name: QName) -> Result<(), DeError> {
         // First one might be in self.peek
         match self.next()? {
             DeEvent::Start(e) => self.reader.read_to_end(e.name())?,
@@ -342,39 +713,49 @@ where
 impl<'de> Deserializer<'de, SliceReader<'de>> {
     /// Create new deserializer that will borrow data from the specified string
     pub fn from_str(s: &'de str) -> Self {
-        Self::from_bytes(s.as_bytes())
+        Self::from_slice(s.as_bytes())
     }
 
     /// Create new deserializer that will borrow data from the specified byte array
-    pub fn from_bytes(bytes: &'de [u8]) -> Self {
+    pub fn from_slice(bytes: &'de [u8]) -> Self {
         let mut reader = Reader::from_bytes(bytes);
         reader
             .expand_empty_elements(true)
             .check_end_names(true)
             .trim_text(true);
-        Self::from_borrowing_reader(SliceReader { reader })
+        Self::new(SliceReader { reader })
     }
 }
 
-macro_rules! deserialize_type {
-    ($deserialize:ident => $visit:ident) => {
-        fn $deserialize<V>(self, visitor: V) -> Result<V::Value, DeError>
-        where
-            V: Visitor<'de>,
-        {
-            let txt = self.next_text()?;
-            // No need to unescape because valid integer representations cannot be escaped
-            let string = txt.decode(self.reader.decoder())?;
-            visitor.$visit(string.parse()?)
-        }
-    };
+impl<'de, R> Deserializer<'de, IoReader<R>>
+where
+    R: BufRead,
+{
+    /// Create new deserializer that will copy data from the specified reader
+    /// into internal buffer. If you already have a string or a byte array, use
+    /// [`Self::from_str`] or [`Self::from_slice`] instead, because they will
+    /// borrow instead of copy, whenever possible
+    pub fn from_reader(reader: R) -> Self {
+        let mut reader = Reader::from_reader(reader);
+        reader
+            .expand_empty_elements(true)
+            .check_end_names(true)
+            .trim_text(true);
+
+        Self::new(IoReader {
+            reader,
+            buf: Vec::new(),
+        })
+    }
 }
 
 impl<'de, 'a, R> de::Deserializer<'de> for &'a mut Deserializer<'de, R>
 where
-    R: BorrowingReader<'de>,
+    R: XmlRead<'de>,
 {
     type Error = DeError;
+
+    deserialize_primitives!();
 
     fn deserialize_struct<V>(
         self,
@@ -387,71 +768,14 @@ where
     {
         // Try to go to the next `<tag ...>...</tag>` or `<tag .../>`
         if let Some(e) = self.next_start()? {
-            let name = e.name().to_vec();
-            self.has_value_field = fields.contains(&INNER_VALUE);
+            let name = e.name().as_ref().to_vec();
             let map = map::MapAccess::new(self, e, fields)?;
             let value = visitor.visit_map(map)?;
-            self.has_value_field = false;
-            self.read_to_end(&name)?;
+            self.read_to_end(QName(&name))?;
             Ok(value)
         } else {
-            Err(DeError::Start)
+            Err(DeError::ExpectedStart)
         }
-    }
-
-    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, DeError>
-    where
-        V: Visitor<'de>,
-    {
-        let txt = self.next_text()?;
-
-        deserialize_bool(txt.as_ref(), self.reader.decoder(), visitor)
-    }
-
-    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, DeError>
-    where
-        V: Visitor<'de>,
-    {
-        let text = self.next_text()?;
-        let string = text.decode_and_escape(self.reader.decoder())?;
-        visitor.visit_string(string.into_owned())
-    }
-
-    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, DeError>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_string(visitor)
-    }
-
-    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, DeError>
-    where
-        V: Visitor<'de>,
-    {
-        let text = self.next_text()?;
-        let string = text.decode_and_escape(self.reader.decoder())?;
-        match string {
-            Cow::Borrowed(string) => visitor.visit_borrowed_str(string),
-            Cow::Owned(string) => visitor.visit_string(string),
-        }
-    }
-
-    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, DeError>
-    where
-        V: Visitor<'de>,
-    {
-        let text = self.next_text()?;
-        let value = text.escaped();
-        visitor.visit_bytes(value)
-    }
-
-    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, DeError>
-    where
-        V: Visitor<'de>,
-    {
-        let text = self.next_text()?;
-        let value = text.into_inner().into_owned();
-        visitor.visit_byte_buf(value)
     }
 
     /// Unit represented in XML as a `xs:element` or text/CDATA content.
@@ -468,10 +792,10 @@ where
     /// |Event             |XML                        |Handling
     /// |------------------|---------------------------|-------------------------------------------
     /// |[`DeEvent::Start`]|`<tag>...</tag>`           |Calls `visitor.visit_unit()`, consumes all events up to corresponding `End` event
-    /// |[`DeEvent::End`]  |`</tag>`                   |Emits [`DeError::End`]
+    /// |[`DeEvent::End`]  |`</tag>`                   |Emits [`UnexpectedEnd("tag")`](DeError::UnexpectedEnd)
     /// |[`DeEvent::Text`] |`text content`             |Calls `visitor.visit_unit()`. Text content is ignored
     /// |[`DeEvent::CData`]|`<![CDATA[cdata content]]>`|Calls `visitor.visit_unit()`. CDATA content is ignored
-    /// |[`DeEvent::Eof`]  |                           |Emits [`DeError::Eof`]
+    /// |[`DeEvent::Eof`]  |                           |Emits [`UnexpectedEof`](DeError::UnexpectedEof)
     fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
@@ -482,8 +806,8 @@ where
                 visitor.visit_unit()
             }
             DeEvent::Text(_) | DeEvent::CData(_) => visitor.visit_unit(),
-            DeEvent::End(_) => Err(DeError::End),
-            DeEvent::Eof => Err(DeError::Eof),
+            DeEvent::End(e) => Err(DeError::UnexpectedEnd(e.name().as_ref().to_owned())),
+            DeEvent::Eof => Err(DeError::UnexpectedEof),
         }
     }
 
@@ -548,7 +872,10 @@ where
     where
         V: Visitor<'de>,
     {
-        visitor.visit_seq(seq::SeqAccess::new(self)?)
+        let seq = visitor.visit_seq(seq::TopLevelSeqAccess::new(self)?);
+        #[cfg(feature = "overlapped-lists")]
+        self.start_replay();
+        seq
     }
 
     fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, DeError>
@@ -564,16 +891,10 @@ where
     {
         match self.peek()? {
             DeEvent::Text(t) if t.is_empty() => visitor.visit_none(),
+            DeEvent::CData(t) if t.is_empty() => visitor.visit_none(),
             DeEvent::Eof => visitor.visit_none(),
             _ => visitor.visit_some(self),
         }
-    }
-
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, DeError>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_string(visitor)
     }
 
     /// Always call `visitor.visit_unit()` because returned value ignored in any case.
@@ -589,8 +910,8 @@ where
     {
         match self.next()? {
             DeEvent::Start(e) => self.read_to_end(e.name())?,
-            DeEvent::End(_) => return Err(DeError::End),
-            DeEvent::Eof => return Err(DeError::Eof),
+            DeEvent::End(e) => return Err(DeError::UnexpectedEnd(e.name().as_ref().to_owned())),
+            DeEvent::Eof => return Err(DeError::UnexpectedEof),
             _ => (),
         }
         visitor.visit_unit()
@@ -607,52 +928,44 @@ where
             _ => self.deserialize_string(visitor),
         }
     }
-
-    deserialize_type!(deserialize_i8 => visit_i8);
-    deserialize_type!(deserialize_i16 => visit_i16);
-    deserialize_type!(deserialize_i32 => visit_i32);
-    deserialize_type!(deserialize_i64 => visit_i64);
-    deserialize_type!(deserialize_u8 => visit_u8);
-    deserialize_type!(deserialize_u16 => visit_u16);
-    deserialize_type!(deserialize_u32 => visit_u32);
-    deserialize_type!(deserialize_u64 => visit_u64);
-    deserialize_type!(deserialize_f32 => visit_f32);
-    deserialize_type!(deserialize_f64 => visit_f64);
-
-    serde_if_integer128! {
-        deserialize_type!(deserialize_i128 => visit_i128);
-        deserialize_type!(deserialize_u128 => visit_u128);
-    }
 }
 
-/// A trait that borrows an XML reader that borrows from the input. For a &[u8]
-/// input the events will borrow from that input, whereas with a BufRead input
-/// all events will be converted to 'static, allocating whenever necessary.
-pub trait BorrowingReader<'i>
-where
-    Self: 'i,
-{
+/// Trait used by the deserializer for iterating over input. This is manually
+/// "specialized" for iterating over `&[u8]`.
+///
+/// You do not need to implement this trait, it is needed to abstract from
+/// [borrowing](SliceReader) and [copying](IoReader) data sources and reuse code in
+/// deserializer
+pub trait XmlRead<'i> {
     /// Return an input-borrowing event.
     fn next(&mut self) -> Result<DeEvent<'i>, DeError>;
 
     /// Skips until end element is found. Unlike `next()` it will not allocate
     /// when it cannot satisfy the lifetime.
-    fn read_to_end(&mut self, name: &[u8]) -> Result<(), DeError>;
+    fn read_to_end(&mut self, name: QName) -> Result<(), DeError>;
 
     /// A copy of the reader's decoder used to decode strings.
     fn decoder(&self) -> Decoder;
 }
 
-struct IoReader<R: BufRead> {
+/// XML input source that reads from a std::io input stream.
+///
+/// You cannot create it, it is created automatically when you call
+/// [`Deserializer::from_reader`]
+pub struct IoReader<R: BufRead> {
     reader: Reader<R>,
     buf: Vec<u8>,
 }
 
-impl<'i, R: BufRead + 'i> BorrowingReader<'i> for IoReader<R> {
+impl<'i, R: BufRead> XmlRead<'i> for IoReader<R> {
     fn next(&mut self) -> Result<DeEvent<'static>, DeError> {
         let event = loop {
             let e = self.reader.read_event(&mut self.buf)?;
             match e {
+                //TODO: Probably not the best idea treat StartText as usual text
+                // Usually this event will represent a BOM
+                // Changing this requires review of the serde-de::top_level::one_element test
+                Event::StartText(e) => break Ok(DeEvent::Text(e.into_owned().into())),
                 Event::Start(e) => break Ok(DeEvent::Start(e.into_owned())),
                 Event::End(e) => break Ok(DeEvent::End(e.into_owned())),
                 Event::Text(e) => break Ok(DeEvent::Text(e.into_owned())),
@@ -668,9 +981,9 @@ impl<'i, R: BufRead + 'i> BorrowingReader<'i> for IoReader<R> {
         event
     }
 
-    fn read_to_end(&mut self, name: &[u8]) -> Result<(), DeError> {
+    fn read_to_end(&mut self, name: QName) -> Result<(), DeError> {
         match self.reader.read_to_end(name, &mut self.buf) {
-            Err(Error::UnexpectedEof(_)) => Err(DeError::Eof),
+            Err(Error::UnexpectedEof(_)) => Err(DeError::UnexpectedEof),
             other => Ok(other?),
         }
     }
@@ -680,15 +993,23 @@ impl<'i, R: BufRead + 'i> BorrowingReader<'i> for IoReader<R> {
     }
 }
 
-struct SliceReader<'de> {
+/// XML input source that reads from a slice of bytes and can borrow from it.
+///
+/// You cannot create it, it is created automatically when you call
+/// [`Deserializer::from_str`] or [`Deserializer::from_slice`]
+pub struct SliceReader<'de> {
     reader: Reader<&'de [u8]>,
 }
 
-impl<'de> BorrowingReader<'de> for SliceReader<'de> {
+impl<'de> XmlRead<'de> for SliceReader<'de> {
     fn next(&mut self) -> Result<DeEvent<'de>, DeError> {
         loop {
             let e = self.reader.read_event_unbuffered()?;
             match e {
+                //TODO: Probably not the best idea treat StartText as usual text
+                // Usually this event will represent a BOM
+                // Changing this requires review of the serde-de::top_level::one_element test
+                Event::StartText(e) => break Ok(DeEvent::Text(e.into())),
                 Event::Start(e) => break Ok(DeEvent::Start(e)),
                 Event::End(e) => break Ok(DeEvent::End(e)),
                 Event::Text(e) => break Ok(DeEvent::Text(e)),
@@ -700,9 +1021,9 @@ impl<'de> BorrowingReader<'de> for SliceReader<'de> {
         }
     }
 
-    fn read_to_end(&mut self, name: &[u8]) -> Result<(), DeError> {
+    fn read_to_end(&mut self, name: QName) -> Result<(), DeError> {
         match self.reader.read_to_end_unbuffered(name) {
-            Err(Error::UnexpectedEof(_)) => Err(DeError::Eof),
+            Err(Error::UnexpectedEof(_)) => Err(DeError::UnexpectedEof),
             other => Ok(other?),
         }
     }
@@ -715,46 +1036,298 @@ impl<'de> BorrowingReader<'de> for SliceReader<'de> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::de::byte_buf::ByteBuf;
-    use serde::de::IgnoredAny;
-    use serde::Deserialize;
+    use pretty_assertions::assert_eq;
 
-    /// Deserialize an instance of type T from a string of XML text.
-    /// If deserialization was succeeded checks that all XML events was consumed
-    fn from_str<'de, T>(s: &'de str) -> Result<T, DeError>
-    where
-        T: Deserialize<'de>,
-    {
-        let mut de = Deserializer::from_str(s);
-        let result = T::deserialize(&mut de);
+    #[cfg(feature = "overlapped-lists")]
+    mod skip {
+        use super::*;
+        use crate::de::DeEvent::*;
+        use crate::events::{BytesEnd, BytesText};
+        use pretty_assertions::assert_eq;
 
-        // If type was deserialized, the whole XML document should be consumed
-        if let Ok(_) = result {
-            assert_eq!(de.next().unwrap(), DeEvent::Eof);
+        /// Checks that `peek()` and `read()` behaves correctly after `skip()`
+        #[test]
+        fn read_and_peek() {
+            let mut de = Deserializer::from_slice(
+                br#"
+                <root>
+                    <inner>
+                        text
+                        <inner/>
+                    </inner>
+                    <next/>
+                    <target/>
+                </root>
+                "#,
+            );
+
+            // Initial conditions - both are empty
+            assert_eq!(de.read, vec![]);
+            assert_eq!(de.write, vec![]);
+
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"root"))
+            );
+            assert_eq!(
+                de.peek().unwrap(),
+                &Start(BytesStart::borrowed_name(b"inner"))
+            );
+
+            // Should skip first <inner> tree
+            de.skip().unwrap();
+            assert_eq!(de.read, vec![]);
+            assert_eq!(
+                de.write,
+                vec![
+                    Start(BytesStart::borrowed_name(b"inner")),
+                    Text(BytesText::from_escaped_str("text")),
+                    Start(BytesStart::borrowed_name(b"inner")),
+                    End(BytesEnd::borrowed(b"inner")),
+                    End(BytesEnd::borrowed(b"inner")),
+                ]
+            );
+
+            // Consume <next/>. Now unconsumed XML looks like:
+            //
+            //   <inner>
+            //     text
+            //     <inner/>
+            //   </inner>
+            //   <target/>
+            // </root>
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"next"))
+            );
+            assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"next")));
+
+            // We finish writing. Next call to `next()` should start replay that messages:
+            //
+            //   <inner>
+            //     text
+            //     <inner/>
+            //   </inner>
+            //
+            // and after that stream that messages:
+            //
+            //   <target/>
+            // </root>
+            de.start_replay();
+            assert_eq!(
+                de.read,
+                vec![
+                    Start(BytesStart::borrowed_name(b"inner")),
+                    Text(BytesText::from_escaped_str("text")),
+                    Start(BytesStart::borrowed_name(b"inner")),
+                    End(BytesEnd::borrowed(b"inner")),
+                    End(BytesEnd::borrowed(b"inner")),
+                ]
+            );
+            assert_eq!(de.write, vec![]);
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"inner"))
+            );
+
+            // Skip `#text` node and consume <inner/> after it
+            de.skip().unwrap();
+            assert_eq!(
+                de.read,
+                vec![
+                    Start(BytesStart::borrowed_name(b"inner")),
+                    End(BytesEnd::borrowed(b"inner")),
+                    End(BytesEnd::borrowed(b"inner")),
+                ]
+            );
+            assert_eq!(
+                de.write,
+                vec![
+                    // This comment here to keep the same formatting of both arrays
+                    // otherwise rustfmt suggest one-line it
+                    Text(BytesText::from_escaped_str("text")),
+                ]
+            );
+
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"inner"))
+            );
+            assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"inner")));
+
+            // We finish writing. Next call to `next()` should start replay messages:
+            //
+            //     text
+            //   </inner>
+            //
+            // and after that stream that messages:
+            //
+            //   <target/>
+            // </root>
+            de.start_replay();
+            assert_eq!(
+                de.read,
+                vec![
+                    Text(BytesText::from_escaped_str("text")),
+                    End(BytesEnd::borrowed(b"inner")),
+                ]
+            );
+            assert_eq!(de.write, vec![]);
+            assert_eq!(
+                de.next().unwrap(),
+                Text(BytesText::from_escaped_str("text"))
+            );
+            assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"inner")));
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"target"))
+            );
+            assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"target")));
+            assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"root")));
         }
 
-        result
+        /// Checks that `read_to_end()` behaves correctly after `skip()`
+        #[test]
+        fn read_to_end() {
+            let mut de = Deserializer::from_slice(
+                br#"
+                <root>
+                    <skip>
+                        text
+                        <skip/>
+                    </skip>
+                    <target>
+                        <target/>
+                    </target>
+                </root>
+                "#,
+            );
+
+            // Initial conditions - both are empty
+            assert_eq!(de.read, vec![]);
+            assert_eq!(de.write, vec![]);
+
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"root"))
+            );
+
+            // Skip the <skip> tree
+            de.skip().unwrap();
+            assert_eq!(de.read, vec![]);
+            assert_eq!(
+                de.write,
+                vec![
+                    Start(BytesStart::borrowed_name(b"skip")),
+                    Text(BytesText::from_escaped_str("text")),
+                    Start(BytesStart::borrowed_name(b"skip")),
+                    End(BytesEnd::borrowed(b"skip")),
+                    End(BytesEnd::borrowed(b"skip")),
+                ]
+            );
+
+            // Drop all events thet represents <target> tree. Now unconsumed XML looks like:
+            //
+            //   <skip>
+            //     text
+            //     <skip/>
+            //   </skip>
+            // </root>
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"target"))
+            );
+            de.read_to_end(QName(b"target")).unwrap();
+            assert_eq!(de.read, vec![]);
+            assert_eq!(
+                de.write,
+                vec![
+                    Start(BytesStart::borrowed_name(b"skip")),
+                    Text(BytesText::from_escaped_str("text")),
+                    Start(BytesStart::borrowed_name(b"skip")),
+                    End(BytesEnd::borrowed(b"skip")),
+                    End(BytesEnd::borrowed(b"skip")),
+                ]
+            );
+
+            // We finish writing. Next call to `next()` should start replay that messages:
+            //
+            //   <skip>
+            //     text
+            //     <skip/>
+            //   </skip>
+            //
+            // and after that stream that messages:
+            //
+            // </root>
+            de.start_replay();
+            assert_eq!(
+                de.read,
+                vec![
+                    Start(BytesStart::borrowed_name(b"skip")),
+                    Text(BytesText::from_escaped_str("text")),
+                    Start(BytesStart::borrowed_name(b"skip")),
+                    End(BytesEnd::borrowed(b"skip")),
+                    End(BytesEnd::borrowed(b"skip")),
+                ]
+            );
+            assert_eq!(de.write, vec![]);
+
+            assert_eq!(
+                de.next().unwrap(),
+                Start(BytesStart::borrowed_name(b"skip"))
+            );
+            de.read_to_end(QName(b"skip")).unwrap();
+
+            assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"root")));
+        }
+
+        /// Checks that limiting buffer size works correctly
+        #[test]
+        fn limit() {
+            use serde::Deserialize;
+
+            #[derive(Debug, Deserialize)]
+            #[allow(unused)]
+            struct List {
+                item: Vec<()>,
+            }
+
+            let mut de = Deserializer::from_slice(
+                br#"
+                <any-name>
+                    <item/>
+                    <another-item>
+                        <some-element>with text</some-element>
+                        <yet-another-element/>
+                    </another-item>
+                    <item/>
+                    <item/>
+                </any-name>
+                "#,
+            );
+            de.event_buffer_size(NonZeroUsize::new(3));
+
+            match List::deserialize(&mut de) {
+                Err(DeError::TooManyEvents(count)) => assert_eq!(count.get(), 3),
+                e => panic!("Expected `Err(TooManyEvents(3))`, but found {:?}", e),
+            }
+        }
     }
 
     #[test]
     fn read_to_end() {
         use crate::de::DeEvent::*;
 
-        let mut reader = Reader::from_bytes(
-            r#"
+        let mut de = Deserializer::from_slice(
+            br#"
             <root>
                 <tag a="1"><tag>text</tag>content</tag>
                 <tag a="2"><![CDATA[cdata content]]></tag>
                 <self-closed/>
             </root>
-            "#
-            .as_bytes(),
+            "#,
         );
-        reader
-            .expand_empty_elements(true)
-            .check_end_names(true)
-            .trim_text(true);
-        let mut de = Deserializer::from_borrowing_reader(SliceReader { reader });
 
         assert_eq!(
             de.next().unwrap(),
@@ -765,7 +1338,7 @@ mod tests {
             de.next().unwrap(),
             Start(BytesStart::borrowed(br#"tag a="1""#, 3))
         );
-        assert_eq!(de.read_to_end(b"tag").unwrap(), ());
+        assert_eq!(de.read_to_end(QName(b"tag")).unwrap(), ());
 
         assert_eq!(
             de.next().unwrap(),
@@ -773,7 +1346,7 @@ mod tests {
         );
         assert_eq!(
             de.next().unwrap(),
-            CData(BytesText::from_plain_str("cdata content"))
+            CData(BytesCData::from_str("cdata content"))
         );
         assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"tag")));
 
@@ -781,7 +1354,7 @@ mod tests {
             de.next().unwrap(),
             Start(BytesStart::borrowed(b"self-closed", 11))
         );
-        assert_eq!(de.read_to_end(b"self-closed").unwrap(), ());
+        assert_eq!(de.read_to_end(QName(b"self-closed")).unwrap(), ());
 
         assert_eq!(de.next().unwrap(), End(BytesEnd::borrowed(b"root")));
         assert_eq!(de.next().unwrap(), Eof);
@@ -884,1286 +1457,37 @@ mod tests {
             reader.next().unwrap(),
             DeEvent::Start(BytesStart::borrowed(b"item ", 4))
         );
-        reader.read_to_end(b"item").unwrap();
+        reader.read_to_end(QName(b"item")).unwrap();
         assert_eq!(reader.next().unwrap(), DeEvent::Eof);
     }
 
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct BorrowedText<'a> {
-        #[serde(rename = "$value")]
-        text: &'a str,
-    }
-
+    /// Ensures, that [`Deserializer::next_text()`] never can get an `End` event,
+    /// because parser reports error early
     #[test]
-    fn string_borrow() {
-        let s = "<text>Hello world</text>";
-
-        let borrowed_item: BorrowedText = from_str(s).unwrap();
-
-        assert_eq!(borrowed_item.text, "Hello world");
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct Item {
-        name: String,
-        source: String,
-    }
-
-    #[test]
-    fn multiple_roots_attributes() {
-        let s = r##"
-	    <item name="hello" source="world.rs" />
-	    <item name="hello" source="world.rs" />
-	"##;
-
-        let item: Vec<Item> = from_str(s).unwrap();
-
-        assert_eq!(
-            item,
-            vec![
-                Item {
-                    name: "hello".to_string(),
-                    source: "world.rs".to_string(),
-                },
-                Item {
-                    name: "hello".to_string(),
-                    source: "world.rs".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct Project {
-        name: String,
-
-        #[serde(rename = "item", default)]
-        items: Vec<Item>,
-    }
-
-    #[test]
-    fn nested_collection() {
-        let s = r##"
-	    <project name="my_project">
-		<item name="hello1" source="world1.rs" />
-		<item name="hello2" source="world2.rs" />
-	    </project>
-	"##;
-
-        let project: Project = from_str(s).unwrap();
-
-        assert_eq!(
-            project,
-            Project {
-                name: "my_project".to_string(),
-                items: vec![
-                    Item {
-                        name: "hello1".to_string(),
-                        source: "world1.rs".to_string(),
-                    },
-                    Item {
-                        name: "hello2".to_string(),
-                        source: "world2.rs".to_string(),
-                    },
-                ],
+    fn next_text() {
+        match from_str::<String>(r#"</root>"#) {
+            Err(DeError::InvalidXml(Error::EndEventMismatch { expected, found })) => {
+                assert_eq!(expected, "");
+                assert_eq!(found, "root");
             }
-        );
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    enum MyEnum {
-        A(String),
-        B { name: String, flag: bool },
-        C,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct MyEnums {
-        // TODO: This should be #[serde(flatten)], but right now serde don't support flattening of sequences
-        // See https://github.com/serde-rs/serde/issues/1905
-        #[serde(rename = "$value")]
-        items: Vec<MyEnum>,
-    }
-
-    #[test]
-    fn collection_of_enums() {
-        let s = r##"
-        <enums>
-            <A>test</A>
-            <B name="hello" flag="t" />
-            <C />
-        </enums>
-        "##;
-
-        let project: MyEnums = from_str(s).unwrap();
-
-        assert_eq!(
-            project,
-            MyEnums {
-                items: vec![
-                    MyEnum::A("test".to_string()),
-                    MyEnum::B {
-                        name: "hello".to_string(),
-                        flag: true,
-                    },
-                    MyEnum::C,
-                ],
-            }
-        );
-    }
-
-    #[test]
-    fn deserialize_bytes() {
-        let s = r#"<item>bytes</item>"#;
-        let item: ByteBuf = from_reader(s.as_bytes()).unwrap();
-
-        assert_eq!(item, ByteBuf(b"bytes".to_vec()));
-    }
-
-    /// Test for https://github.com/tafia/quick-xml/issues/231
-    #[test]
-    fn implicit_value() {
-        use serde_value::Value;
-
-        let s = r#"<root>content</root>"#;
-        let item: Value = from_str(s).unwrap();
-
-        assert_eq!(
-            item,
-            Value::Map(
-                vec![(
-                    Value::String("$value".into()),
-                    Value::String("content".into())
-                )]
-                .into_iter()
-                .collect()
-            )
-        );
-    }
-
-    #[test]
-    fn explicit_value() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Item {
-            #[serde(rename = "$value")]
-            content: String,
+            x => panic!(
+                r#"Expected `Err(InvalidXml(EndEventMismatch("", "root")))`, but found {:?}"#,
+                x
+            ),
         }
 
-        let s = r#"<root>content</root>"#;
-        let item: Item = from_str(s).unwrap();
+        let s: String = from_str(r#"<root></root>"#).unwrap();
+        assert_eq!(s, "");
 
-        assert_eq!(
-            item,
-            Item {
-                content: "content".into()
+        match from_str::<String>(r#"<root></other>"#) {
+            Err(DeError::InvalidXml(Error::EndEventMismatch { expected, found })) => {
+                assert_eq!(expected, "root");
+                assert_eq!(found, "other");
             }
-        );
-    }
-
-    #[test]
-    fn without_value() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Item;
-
-        let s = r#"<root>content</root>"#;
-        let item: Item = from_str(s).unwrap();
-
-        assert_eq!(item, Item);
-    }
-
-    /// Tests calling `deserialize_ignored_any`
-    #[test]
-    fn ignored_any() {
-        let err = from_str::<IgnoredAny>("");
-        match err {
-            Err(DeError::Eof) => {}
-            other => panic!("Expected `Eof`, found {:?}", other),
-        }
-
-        from_str::<IgnoredAny>(r#"<empty/>"#).unwrap();
-        from_str::<IgnoredAny>(r#"<with-attributes key="value"/>"#).unwrap();
-        from_str::<IgnoredAny>(r#"<nested>text</nested>"#).unwrap();
-        from_str::<IgnoredAny>(r#"<nested><![CDATA[cdata]]></nested>"#).unwrap();
-        from_str::<IgnoredAny>(r#"<nested><nested/></nested>"#).unwrap();
-    }
-
-    mod unit {
-        use super::*;
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Unit;
-
-        #[test]
-        fn simple() {
-            let data: Unit = from_str("<root/>").unwrap();
-            assert_eq!(data, Unit);
-        }
-
-        #[test]
-        fn excess_attribute() {
-            let data: Unit = from_str(r#"<root excess="attribute"/>"#).unwrap();
-            assert_eq!(data, Unit);
-        }
-
-        #[test]
-        fn excess_element() {
-            let data: Unit = from_str(r#"<root><excess>element</excess></root>"#).unwrap();
-            assert_eq!(data, Unit);
-        }
-
-        #[test]
-        fn excess_text() {
-            let data: Unit = from_str(r#"<root>excess text</root>"#).unwrap();
-            assert_eq!(data, Unit);
-        }
-
-        #[test]
-        fn excess_cdata() {
-            let data: Unit = from_str(r#"<root><![CDATA[excess CDATA]]></root>"#).unwrap();
-            assert_eq!(data, Unit);
-        }
-    }
-
-    mod newtype {
-        use super::*;
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Newtype(bool);
-
-        #[test]
-        fn simple() {
-            let data: Newtype = from_str("<root>true</root>").unwrap();
-            assert_eq!(data, Newtype(true));
-        }
-
-        #[test]
-        fn excess_attribute() {
-            let data: Newtype = from_str(r#"<root excess="attribute">true</root>"#).unwrap();
-            assert_eq!(data, Newtype(true));
-        }
-    }
-
-    mod tuple {
-        use super::*;
-
-        #[test]
-        fn simple() {
-            let data: (f32, String) = from_str("<root>42</root><root>answer</root>").unwrap();
-            assert_eq!(data, (42.0, "answer".into()));
-        }
-
-        #[test]
-        fn excess_attribute() {
-            let data: (f32, String) =
-                from_str(r#"<root excess="attribute">42</root><root>answer</root>"#).unwrap();
-            assert_eq!(data, (42.0, "answer".into()));
-        }
-    }
-
-    mod tuple_struct {
-        use super::*;
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Tuple(f32, String);
-
-        #[test]
-        fn simple() {
-            let data: Tuple = from_str("<root>42</root><root>answer</root>").unwrap();
-            assert_eq!(data, Tuple(42.0, "answer".into()));
-        }
-
-        #[test]
-        fn excess_attribute() {
-            let data: Tuple =
-                from_str(r#"<root excess="attribute">42</root><root>answer</root>"#).unwrap();
-            assert_eq!(data, Tuple(42.0, "answer".into()));
-        }
-    }
-
-    macro_rules! maplike_errors {
-        ($type:ty) => {
-            mod non_closed {
-                use super::*;
-
-                #[test]
-                fn attributes() {
-                    let data = from_str::<$type>(r#"<root float="42" string="answer">"#);
-
-                    match data {
-                        Err(DeError::Eof) => (),
-                        _ => panic!("Expected `Eof`, found {:?}", data),
-                    }
-                }
-
-                #[test]
-                fn elements_root() {
-                    let data = from_str::<$type>(r#"<root float="42"><string>answer</string>"#);
-
-                    match data {
-                        Err(DeError::Eof) => (),
-                        _ => panic!("Expected `Eof`, found {:?}", data),
-                    }
-                }
-
-                #[test]
-                fn elements_child() {
-                    let data = from_str::<$type>(r#"<root float="42"><string>answer"#);
-
-                    match data {
-                        Err(DeError::Eof) => (),
-                        _ => panic!("Expected `Eof`, found {:?}", data),
-                    }
-                }
-            }
-
-            mod mismatched_end {
-                use super::*;
-                use crate::errors::Error::EndEventMismatch;
-
-                #[test]
-                fn attributes() {
-                    let data =
-                        from_str::<$type>(r#"<root float="42" string="answer"></mismatched>"#);
-
-                    match data {
-                        Err(DeError::Xml(EndEventMismatch { .. })) => (),
-                        _ => panic!("Expected `Xml(EndEventMismatch)`, found {:?}", data),
-                    }
-                }
-
-                #[test]
-                fn elements_root() {
-                    let data = from_str::<$type>(
-                        r#"<root float="42"><string>answer</string></mismatched>"#,
-                    );
-
-                    match data {
-                        Err(DeError::Xml(EndEventMismatch { .. })) => (),
-                        _ => panic!("Expected `Xml(EndEventMismatch)`, found {:?}", data),
-                    }
-                }
-
-                #[test]
-                fn elements_child() {
-                    let data =
-                        from_str::<$type>(r#"<root float="42"><string>answer</mismatched></root>"#);
-
-                    match data {
-                        Err(DeError::Xml(EndEventMismatch { .. })) => (),
-                        _ => panic!("Expected `Xml(EndEventMismatch)`, found {:?}", data),
-                    }
-                }
-            }
-        };
-    }
-
-    mod map {
-        use super::*;
-        use std::collections::HashMap;
-        use std::iter::FromIterator;
-
-        #[test]
-        fn elements() {
-            let data: HashMap<(), ()> =
-                from_str(r#"<root><float>42</float><string>answer</string></root>"#).unwrap();
-            assert_eq!(
-                data,
-                HashMap::from_iter([((), ()), ((), ()),].iter().cloned())
-            );
-        }
-
-        #[test]
-        fn attributes() {
-            let data: HashMap<(), ()> = from_str(r#"<root float="42" string="answer"/>"#).unwrap();
-            assert_eq!(
-                data,
-                HashMap::from_iter([((), ()), ((), ()),].iter().cloned())
-            );
-        }
-
-        #[test]
-        fn attribute_and_element() {
-            let data: HashMap<(), ()> = from_str(
-                r#"
-                <root float="42">
-                    <string>answer</string>
-                </root>
-            "#,
-            )
-            .unwrap();
-
-            assert_eq!(
-                data,
-                HashMap::from_iter([((), ()), ((), ()),].iter().cloned())
-            );
-        }
-
-        maplike_errors!(HashMap<(), ()>);
-    }
-
-    mod struct_ {
-        use super::*;
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Struct {
-            float: f64,
-            string: String,
-        }
-
-        #[test]
-        fn elements() {
-            let data: Struct =
-                from_str(r#"<root><float>42</float><string>answer</string></root>"#).unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    float: 42.0,
-                    string: "answer".into()
-                }
-            );
-        }
-
-        #[test]
-        fn excess_elements() {
-            let data: Struct = from_str(
-                r#"
-                <root>
-                    <before/>
-                    <float>42</float>
-                    <in-the-middle/>
-                    <string>answer</string>
-                    <after/>
-                </root>"#,
-            )
-            .unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    float: 42.0,
-                    string: "answer".into()
-                }
-            );
-        }
-
-        #[test]
-        fn attributes() {
-            let data: Struct = from_str(r#"<root float="42" string="answer"/>"#).unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    float: 42.0,
-                    string: "answer".into()
-                }
-            );
-        }
-
-        #[test]
-        fn excess_attributes() {
-            let data: Struct = from_str(
-                r#"<root before="1" float="42" in-the-middle="2" string="answer" after="3"/>"#,
-            )
-            .unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    float: 42.0,
-                    string: "answer".into()
-                }
-            );
-        }
-
-        #[test]
-        fn attribute_and_element() {
-            let data: Struct = from_str(
-                r#"
-                <root float="42">
-                    <string>answer</string>
-                </root>
-            "#,
-            )
-            .unwrap();
-
-            assert_eq!(
-                data,
-                Struct {
-                    float: 42.0,
-                    string: "answer".into()
-                }
-            );
-        }
-
-        maplike_errors!(Struct);
-    }
-
-    mod nested_struct {
-        use super::*;
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Struct {
-            nested: Nested,
-            string: String,
-        }
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Nested {
-            float: f32,
-        }
-
-        #[test]
-        fn elements() {
-            let data: Struct = from_str(
-                r#"<root><string>answer</string><nested><float>42</float></nested></root>"#,
-            )
-            .unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    nested: Nested { float: 42.0 },
-                    string: "answer".into()
-                }
-            );
-        }
-
-        #[test]
-        fn attributes() {
-            let data: Struct =
-                from_str(r#"<root string="answer"><nested float="42"/></root>"#).unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    nested: Nested { float: 42.0 },
-                    string: "answer".into()
-                }
-            );
-        }
-    }
-
-    mod flatten_struct {
-        use super::*;
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Struct {
-            #[serde(flatten)]
-            nested: Nested,
-            string: String,
-        }
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Nested {
-            //TODO: change to f64 after fixing https://github.com/serde-rs/serde/issues/1183
-            float: String,
-        }
-
-        #[test]
-        #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-        fn elements() {
-            let data: Struct =
-                from_str(r#"<root><float>42</float><string>answer</string></root>"#).unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    nested: Nested { float: "42".into() },
-                    string: "answer".into()
-                }
-            );
-        }
-
-        #[test]
-        fn attributes() {
-            let data: Struct = from_str(r#"<root float="42" string="answer"/>"#).unwrap();
-            assert_eq!(
-                data,
-                Struct {
-                    nested: Nested { float: "42".into() },
-                    string: "answer".into()
-                }
-            );
-        }
-    }
-
-    mod enum_ {
-        use super::*;
-
-        mod externally_tagged {
-            use super::*;
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            enum Node {
-                Unit,
-                Newtype(bool),
-                //TODO: serde bug https://github.com/serde-rs/serde/issues/1904
-                // Tuple(f64, String),
-                Struct {
-                    float: f64,
-                    string: String,
-                },
-                Holder {
-                    nested: Nested,
-                    string: String,
-                },
-                Flatten {
-                    #[serde(flatten)]
-                    nested: Nested,
-                    string: String,
-                },
-            }
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            struct Nested {
-                //TODO: change to f64 after fixing https://github.com/serde-rs/serde/issues/1183
-                float: String,
-            }
-
-            /// Workaround for serde bug https://github.com/serde-rs/serde/issues/1904
-            #[derive(Debug, Deserialize, PartialEq)]
-            enum Workaround {
-                Tuple(f64, String),
-            }
-
-            #[test]
-            fn unit() {
-                let data: Node = from_str("<Unit/>").unwrap();
-                assert_eq!(data, Node::Unit);
-            }
-
-            #[test]
-            fn newtype() {
-                let data: Node = from_str("<Newtype>true</Newtype>").unwrap();
-                assert_eq!(data, Node::Newtype(true));
-            }
-
-            #[test]
-            fn tuple_struct() {
-                let data: Workaround = from_str("<Tuple>42</Tuple><Tuple>answer</Tuple>").unwrap();
-                assert_eq!(data, Workaround::Tuple(42.0, "answer".into()));
-            }
-
-            mod struct_ {
-                use super::*;
-
-                #[test]
-                fn elements() {
-                    let data: Node =
-                        from_str(r#"<Struct><float>42</float><string>answer</string></Struct>"#)
-                            .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: 42.0,
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(r#"<Struct float="42" string="answer"/>"#).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: 42.0,
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod nested_struct {
-                use super::*;
-
-                #[test]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<Holder><string>answer</string><nested><float>42</float></nested></Holder>"#
-                    ).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node =
-                        from_str(r#"<Holder string="answer"><nested float="42"/></Holder>"#)
-                            .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod flatten_struct {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node =
-                        from_str(r#"<Flatten><float>42</float><string>answer</string></Flatten>"#)
-                            .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(r#"<Flatten float="42" string="answer"/>"#).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-        }
-
-        mod internally_tagged {
-            use super::*;
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            #[serde(tag = "tag")]
-            enum Node {
-                Unit,
-                /// Primitives (such as `bool`) are not supported by serde in the internally tagged mode
-                Newtype(NewtypeContent),
-                // Tuple(f64, String),// Tuples are not supported in the internally tagged mode
-                //TODO: change to f64 after fixing https://github.com/serde-rs/serde/issues/1183
-                Struct {
-                    float: String,
-                    string: String,
-                },
-                Holder {
-                    nested: Nested,
-                    string: String,
-                },
-                Flatten {
-                    #[serde(flatten)]
-                    nested: Nested,
-                    string: String,
-                },
-            }
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            struct NewtypeContent {
-                value: bool,
-            }
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            struct Nested {
-                //TODO: change to f64 after fixing https://github.com/serde-rs/serde/issues/1183
-                float: String,
-            }
-
-            mod unit {
-                use super::*;
-
-                #[test]
-                fn elements() {
-                    let data: Node = from_str(r#"<root><tag>Unit</tag></root>"#).unwrap();
-                    assert_eq!(data, Node::Unit);
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(r#"<root tag="Unit"/>"#).unwrap();
-                    assert_eq!(data, Node::Unit);
-                }
-            }
-
-            mod newtype {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node =
-                        from_str(r#"<root><tag>Newtype</tag><value>true</value></root>"#).unwrap();
-                    assert_eq!(data, Node::Newtype(NewtypeContent { value: true }));
-                }
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn attributes() {
-                    let data: Node = from_str(r#"<root tag="Newtype" value="true"/>"#).unwrap();
-                    assert_eq!(data, Node::Newtype(NewtypeContent { value: true }));
-                }
-            }
-
-            mod struct_ {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<root><tag>Struct</tag><float>42</float><string>answer</string></root>"#,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: "42".into(),
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node =
-                        from_str(r#"<root tag="Struct" float="42" string="answer"/>"#).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: "42".into(),
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod nested_struct {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<root><tag>Holder</tag><string>answer</string><nested><float>42</float></nested></root>"#
-                    ).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(
-                        r#"<root tag="Holder" string="answer"><nested float="42"/></root>"#,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod flatten_struct {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<root><tag>Flatten</tag><float>42</float><string>answer</string></root>"#
-                    ).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node =
-                        from_str(r#"<root tag="Flatten" float="42" string="answer"/>"#).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-        }
-
-        mod adjacently_tagged {
-            use super::*;
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            #[serde(tag = "tag", content = "content")]
-            enum Node {
-                Unit,
-                Newtype(bool),
-                //TODO: serde bug https://github.com/serde-rs/serde/issues/1904
-                // Tuple(f64, String),
-                Struct {
-                    float: f64,
-                    string: String,
-                },
-                Holder {
-                    nested: Nested,
-                    string: String,
-                },
-                Flatten {
-                    #[serde(flatten)]
-                    nested: Nested,
-                    string: String,
-                },
-            }
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            struct Nested {
-                //TODO: change to f64 after fixing https://github.com/serde-rs/serde/issues/1183
-                float: String,
-            }
-
-            /// Workaround for serde bug https://github.com/serde-rs/serde/issues/1904
-            #[derive(Debug, Deserialize, PartialEq)]
-            #[serde(tag = "tag", content = "content")]
-            enum Workaround {
-                Tuple(f64, String),
-            }
-
-            mod unit {
-                use super::*;
-
-                #[test]
-                fn elements() {
-                    let data: Node = from_str(r#"<root><tag>Unit</tag></root>"#).unwrap();
-                    assert_eq!(data, Node::Unit);
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(r#"<root tag="Unit"/>"#).unwrap();
-                    assert_eq!(data, Node::Unit);
-                }
-            }
-
-            mod newtype {
-                use super::*;
-
-                #[test]
-                fn elements() {
-                    let data: Node =
-                        from_str(r#"<root><tag>Newtype</tag><content>true</content></root>"#)
-                            .unwrap();
-                    assert_eq!(data, Node::Newtype(true));
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(r#"<root tag="Newtype" content="true"/>"#).unwrap();
-                    assert_eq!(data, Node::Newtype(true));
-                }
-            }
-
-            mod tuple_struct {
-                use super::*;
-                #[test]
-                fn elements() {
-                    let data: Workaround = from_str(
-                        r#"<root><tag>Tuple</tag><content>42</content><content>answer</content></root>"#
-                    ).unwrap();
-                    assert_eq!(data, Workaround::Tuple(42.0, "answer".into()));
-                }
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn attributes() {
-                    let data: Workaround = from_str(
-                        r#"<root tag="Tuple" content="42"><content>answer</content></root>"#,
-                    )
-                    .unwrap();
-                    assert_eq!(data, Workaround::Tuple(42.0, "answer".into()));
-                }
-            }
-
-            mod struct_ {
-                use super::*;
-
-                #[test]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<root><tag>Struct</tag><content><float>42</float><string>answer</string></content></root>"#
-                    ).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: 42.0,
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(
-                        r#"<root tag="Struct"><content float="42" string="answer"/></root>"#,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: 42.0,
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod nested_struct {
-                use super::*;
-
-                #[test]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<root>
-                            <tag>Holder</tag>
-                            <content>
-                                <string>answer</string>
-                                <nested>
-                                    <float>42</float>
-                                </nested>
-                            </content>
-                        </root>"#,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(
-                        r#"<root tag="Holder"><content string="answer"><nested float="42"/></content></root>"#
-                    ).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod flatten_struct {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<root><tag>Flatten</tag><content><float>42</float><string>answer</string></content></root>"#
-                    ).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(
-                        r#"<root tag="Flatten"><content float="42" string="answer"/></root>"#,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-        }
-
-        mod untagged {
-            use super::*;
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            #[serde(untagged)]
-            enum Node {
-                Unit,
-                Newtype(bool),
-                // serde bug https://github.com/serde-rs/serde/issues/1904
-                // Tuple(f64, String),
-                Struct {
-                    float: f64,
-                    string: String,
-                },
-                Holder {
-                    nested: Nested,
-                    string: String,
-                },
-                Flatten {
-                    #[serde(flatten)]
-                    nested: Nested,
-                    // Can't use "string" as name because in that case this variant
-                    // will have no difference from `Struct` variant
-                    string2: String,
-                },
-            }
-
-            #[derive(Debug, Deserialize, PartialEq)]
-            struct Nested {
-                //TODO: change to f64 after fixing https://github.com/serde-rs/serde/issues/1183
-                float: String,
-            }
-
-            /// Workaround for serde bug https://github.com/serde-rs/serde/issues/1904
-            #[derive(Debug, Deserialize, PartialEq)]
-            #[serde(untagged)]
-            enum Workaround {
-                Tuple(f64, String),
-            }
-
-            #[test]
-            #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-            fn unit() {
-                // Unit variant consists just from the tag, and because tags
-                // are not written, nothing is written
-                let data: Node = from_str("").unwrap();
-                assert_eq!(data, Node::Unit);
-            }
-
-            #[test]
-            #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-            fn newtype() {
-                let data: Node = from_str("true").unwrap();
-                assert_eq!(data, Node::Newtype(true));
-            }
-
-            #[test]
-            #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-            fn tuple_struct() {
-                let data: Workaround = from_str("<root>42</root><root>answer</root>").unwrap();
-                assert_eq!(data, Workaround::Tuple(42.0, "answer".into()));
-            }
-
-            mod struct_ {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node =
-                        from_str(r#"<root><float>42</float><string>answer</string></root>"#)
-                            .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: 42.0,
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn attributes() {
-                    let data: Node = from_str(r#"<root float="42" string="answer"/>"#).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Struct {
-                            float: 42.0,
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod nested_struct {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node = from_str(
-                        r#"<root><string>answer</string><nested><float>42</float></nested></root>"#,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node =
-                        from_str(r#"<root string="answer"><nested float="42"/></root>"#).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Holder {
-                            nested: Nested { float: "42".into() },
-                            string: "answer".into()
-                        }
-                    );
-                }
-            }
-
-            mod flatten_struct {
-                use super::*;
-
-                #[test]
-                #[ignore = "Prime cause: deserialize_any under the hood + https://github.com/serde-rs/serde/issues/1183"]
-                fn elements() {
-                    let data: Node =
-                        from_str(r#"<root><float>42</float><string2>answer</string2></root>"#)
-                            .unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string2: "answer".into()
-                        }
-                    );
-                }
-
-                #[test]
-                fn attributes() {
-                    let data: Node = from_str(r#"<root float="42" string2="answer"/>"#).unwrap();
-                    assert_eq!(
-                        data,
-                        Node::Flatten {
-                            nested: Nested { float: "42".into() },
-                            string2: "answer".into()
-                        }
-                    );
-                }
-            }
+            x => panic!(
+                r#"Expected `Err(InvalidXml(EndEventMismatch("root", "other")))`, but found {:?}"#,
+                x
+            ),
         }
     }
 }

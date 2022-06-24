@@ -10,15 +10,142 @@
 
 ## Unreleased
 
+### New Features
+
+- [#387]: Allow overlapping between elements of sequence and other elements
+  (using new feature `overlapped-lists`)
+- [#393]: New module `name` with `QName`, `LocalName`, `Namespace`, `Prefix`
+  and `PrefixDeclaration` wrappers around byte arrays and `ResolveResult` with
+  the result of namespace resolution
+- [#180]: Make `Decoder` struct public. You already had access to it via the
+  `Reader::decoder()` method, but could not name it in the code. Now the preferred
+  way to access decoding functionality is via this struct
+- [#191]: New event variant `StartText` emitted for bytes before the XML declaration
+  or a start comment or a tag. For streams with BOM this event will contain a BOM
+- [#395]: Add support for XML Schema `xs:list`
+
+### Bug Fixes
+
+- [#9]: Deserialization erroneously was successful in some cases where error is expected.
+  This broke deserialization of untagged enums which rely on error if variant cannot be parsed
+- [#387]: Allow to have an ordinary elements together with a `$value` field
+- [#387]: Internal deserializer state can be broken when deserializing a map with
+  a sequence field (such as `Vec<T>`), where elements of this sequence contains
+  another sequence. This error affects only users with the `serialize` feature enabled
+- [#393]: Now `event_namespace`, `attribute_namespace` and `read_event_namespaced`
+  returns `ResolveResult::Unknown` if prefix was not registered in namespace buffer
+- [#393]: Fix breaking processing after encounter an attribute with a reserved name (started with "xmlns")
+- [#363]: Do not generate empty `Event::Text` events
+
+### Misc Changes
+
+- [#8]: Changes in the error type `DeError`:
+  |Variant|Change
+  |-------|---------------------------------------------------------------------
+  |~~`DeError::Text`~~|Removed because never raised
+  |~~`DeError::InvalidEnum`~~|Removed because never raised
+  |`DeError::Xml`|Renamed to `DeError::InvalidXml` for consistency with `DeError::InvalidBoolean`
+  |`DeError::Int`|Renamed to `DeError::InvalidInt` for consistency with `DeError::InvalidBoolean`
+  |`DeError::Float`|Renamed to `DeError::InvalidFloat` for consistency with `DeError::InvalidBoolean`
+  |`DeError::Start`|Renamed to `DeError::UnexpectedStart` and tag name added to an error
+  |`DeError::End`|Renamed to `DeError::UnexpectedEnd` and tag name added to an error
+  |`DeEvent::Eof`|Renamed to `DeError::UnexpectedEof`
+  |`DeError::EndOfAttributes`|Renamed to `DeError::KeyNotFound`
+  |`DeError::ExpectedStart`|Added
+
+- [#391]: Added code coverage
+
+- [#393]: `event_namespace` and `attribute_namespace` now accept `QName`
+  and returns `ResolveResult` and `LocalName`, `read_event_namespaced` now
+  returns `ResolveResult` instead of `Option<[u8]>`
+- [#393]: Types of `Attribute::key` and `Attr::key()` changed to `QName`
+- [#393]: Now `BytesStart::name()` and `BytesEnd::name()` returns `QName`, and
+  `BytesStart::local_name()` and `BytesEnd::local_name()` returns `LocalName`
+
+- [#191]: Remove unused `reader.decoder().decode_owned()`. If you ever used it,
+  use `String::from_utf8` instead (which that function did)
+- [#191]: Remove `*_without_bom` methods from the `Attributes` struct because they are useless.
+  Use the same-named methods without that suffix instead. Attribute values cannot contain BOM
+- [#191]: Remove `Reader::decode()` and `Reader::decode_without_bom()`, they are replaced by
+  `Decoder::decode()` and `Decoder::decode_with_bom_removal()`.
+  Use `reader.decoder().decode_*(...)` instead of `reader.decode_*(...)` for now.
+  `Reader::encoding()` is replaced by `Decoder::encoding()` as well
+- [#191]: Remove poorly designed `BytesText::unescape_and_decode_without_bom()` and
+  `BytesText::unescape_and_decode_without_bom_with_custom_entities()`. Although these methods worked
+  as expected, this was only due to good luck. They was replaced by the
+  `BytesStartText::decode_with_bom_removal()`:
+  - conceptually, you should decode BOM only for the first `Text` event from the
+    reader (since now `StartText` event is emitted instead for this)
+  - text before the first tag is not an XML content at all, so it is meaningless
+    to try to unescape something in it
+
+- [#180]: Eliminated the differences in the decoding API when feature `encoding` enabled and when it is
+  disabled. Signatures of functions are now the same regardless of whether or not the feature is
+  enabled, and an error will be returned instead of performing replacements for invalid characters
+  in both cases.
+
+  Previously, if the `encoding` feature was enabled, decoding functions would return `Result<Cow<&str>>`
+  while without this feature they would return `Result<&str>`. With this change, only `Result<Cow<&str>>`
+  is returned regardless of the status of the feature.
+- [#180]: Error variant `Error::Utf8` replaced by `Error::NonDecodable`
+
+- [#118]: Remove `BytesStart::unescaped*` set of methods because they could return wrong results
+  Use methods on `Attribute` instead
+
+### New Tests
+
+- [#9]: Added tests for incorrect nested tags in input
+- [#387]: Added a bunch of tests for sequences deserialization
+- [#393]: Added more tests for namespace resolver
+- [#393]: Added tests for reserved names (started with "xml"i) -- see <https://www.w3.org/TR/xml-names11/#xmlReserved>
+- [#363]: Add tests for `Reader::read_event_buffered` to ensure that proper events generated for corresponding inputs
+
+[#8]: https://github.com/Mingun/fast-xml/pull/8
+[#9]: https://github.com/Mingun/fast-xml/pull/9
+[#180]: https://github.com/tafia/quick-xml/issues/180
+[#191]: https://github.com/tafia/quick-xml/issues/191
+[#363]: https://github.com/tafia/quick-xml/issues/363
+[#387]: https://github.com/tafia/quick-xml/pull/387
+[#391]: https://github.com/tafia/quick-xml/pull/391
+[#393]: https://github.com/tafia/quick-xml/pull/393
+[#395]: https://github.com/tafia/quick-xml/pull/395
+
+## 0.23.0 -- 2022-05-08
+
+- feat: add support for `i128` / `u128` in attributes or text/CDATA content
 - test: add tests for malformed inputs for serde deserializer
 - fix: allow to deserialize `unit`s from any data in attribute values and text nodes
 - refactor: unify errors when EOF encountered during serde deserialization
 - test: ensure that after deserializing all XML was consumed
-- feat: add `Deserializer::from_str` and `Deserializer::from_bytes`
+- feat: add `Deserializer::from_str`, `Deserializer::from_slice` and `Deserializer::from_reader`
+- refactor: deprecate `from_bytes` and `Deserializer::from_borrowing_reader` because
+  they are fully equivalent to `from_slice` and `Deserializer::new`
 - refactor: reduce number of unnecessary copies when deserialize numbers/booleans/identifiers
   from the attribute and element names and attribute values
 - fix: allow to deserialize `unit`s from text and CDATA content.
   `DeError::InvalidUnit` variant is removed, because after fix it is no longer used
+- fix: `ElementWriter`, introduced in [#274](https://github.com/tafia/quick-xml/pull/274)
+  (0.23.0-alpha2) now available to end users
+- fix: allow lowercase `<!doctype >` definition (used in HTML 5) when parse document from `&[u8]`
+- test: add tests for consistence behavior of buffered and borrowed readers
+- fix: produce consistent error positions in buffered and borrowed readers
+- feat: `Error::UnexpectedBang` now provide the byte found
+- refactor: unify code for buffered and borrowed readers
+- fix: fix internal panic message when parse malformed XML
+  ([#344](https://github.com/tafia/quick-xml/issues/344))
+- test: add tests for trivial documents (empty / only comment / `<root>...</root>` -- one tag with content)
+- fix: CDATA was not handled in many cases where it should
+- fix: do not unescape CDATA content because it never escaped by design.
+  CDATA event data now represented by its own `BytesCData` type
+  ([quick-xml#311](https://github.com/tafia/quick-xml/issues/311))
+- feat: add `Reader::get_ref()` and `Reader::get_mut()`, rename
+  `Reader::into_underlying_reader()` to `Reader::into_inner()`
+- refactor: now `Attributes::next()` returns a new type `AttrError` when attribute parsing failed
+  ([#4](https://github.com/Mingun/fast-xml/pull/4))
+- test: properly test all paths of attributes parsing ([#4](https://github.com/Mingun/fast-xml/pull/4))
+- feat: attribute iterator now implements `FusedIterator` ([#4](https://github.com/Mingun/fast-xml/pull/4))
+- fix: fixed many errors in attribute parsing using iterator, returned from `attributes()`
+  or `html_attributes()` ([#4](https://github.com/Mingun/fast-xml/pull/4))
 
 ## 0.23.0-alpha3
 

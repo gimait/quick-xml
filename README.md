@@ -2,6 +2,7 @@
 
 ![status](https://github.com/tafia/quick-xml/actions/workflows/rust.yml/badge.svg)
 [![Crate](https://img.shields.io/crates/v/quick-xml.svg)](https://crates.io/crates/quick-xml)
+[![codecov](https://img.shields.io/codecov/c/github/tafia/quick-xml)](https://codecov.io/gh/tafia/quick-xml)
 
 High performance xml pull reader/writer.
 
@@ -118,10 +119,7 @@ Here is an example deserializing crates.io source:
 // Cargo.toml
 // [dependencies]
 // serde = { version = "1.0", features = [ "derive" ] }
-// quick-xml = { version = "0.21", features = [ "serialize" ] }
-extern crate serde;
-extern crate quick_xml;
-
+// quick-xml = { version = "0.22", features = [ "serialize" ] }
 use serde::Deserialize;
 use quick_xml::de::{from_str, DeError};
 
@@ -217,6 +215,8 @@ This has largely been inspired by [serde-xml-rs](https://github.com/RReverser/se
 quick-xml follows its convention for deserialization, including the
 [`$value`](https://github.com/RReverser/serde-xml-rs#parsing-the-value-of-a-tag) special name.
 
+Original [quick-xml] was developed by @tafia and abandoned around end of 2021.
+
 ### Parsing the "value" of a tag
 
 If you have an input of the form `<foo abc="xyz">bar</foo>`, and you want to get at the `bar`, you can use the special name `$value`:
@@ -281,7 +281,7 @@ In the case of struct variants or when the newtype is a primitive adding this ta
 
 ### Performance
 
-Note that despite not focusing on performance (there are several unecessary copies), it remains about 10x faster than serde-xml-rs.
+Note that despite not focusing on performance (there are several unnecessary copies), it remains about 10x faster than serde-xml-rs.
 
 # Features
 
@@ -293,6 +293,7 @@ Note that despite not focusing on performance (there are several unecessary copi
 Benchmarking is hard and the results depend on your input file and your machine.
 
 Here on my particular file, quick-xml is around **50 times faster** than [xml-rs](https://crates.io/crates/xml-rs) crate.
+_(measurements was done while this crate named quick-xml)_
 
 ```
 // quick-xml benches
@@ -317,3 +318,5 @@ Any PR is welcomed!
 ## License
 
 MIT
+
+[quick-xml]: https://github.com/tafia/quick-xml

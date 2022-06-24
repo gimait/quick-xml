@@ -50,7 +50,7 @@
 //!         Ok(Event::Start(ref e)) => {
 //!         // for namespaced:
 //!         // Ok((ref namespace_value, Event::Start(ref e)))
-//!             match e.name() {
+//!             match e.name().as_ref() {
 //!                 b"tag1" => println!("attributes values: {:?}",
 //!                                     e.attributes().map(|a| a.unwrap().value)
 //!                                     .collect::<Vec<_>>()),
@@ -73,6 +73,7 @@
 //! ### Writer
 //!
 //! ```rust
+//! # use pretty_assertions::assert_eq;
 //! use quick_xml::Writer;
 //! use quick_xml::events::{Event, BytesEnd, BytesStart};
 //! use quick_xml::Reader;
@@ -86,7 +87,7 @@
 //! let mut buf = Vec::new();
 //! loop {
 //!     match reader.read_event(&mut buf) {
-//!         Ok(Event::Start(ref e)) if e.name() == b"this_tag" => {
+//!         Ok(Event::Start(ref e)) if e.name().as_ref() == b"this_tag" => {
 //!
 //!             // crates a new element ... alternatively we could reuse `e` by calling
 //!             // `e.into_owned()`
@@ -101,7 +102,7 @@
 //!             // writes the event to the writer
 //!             assert!(writer.write_event(Event::Start(elem)).is_ok());
 //!         },
-//!         Ok(Event::End(ref e)) if e.name() == b"this_tag" => {
+//!         Ok(Event::End(ref e)) if e.name().as_ref() == b"this_tag" => {
 //!             assert!(writer.write_event(Event::End(BytesEnd::borrowed(b"my_elem"))).is_ok());
 //!         },
 //!         Ok(Event::Eof) => break,
@@ -120,23 +121,17 @@
 //!
 //! # Features
 //!
-//! quick-xml supports 2 additional features, non activated by default:
-//! - `encoding`: support non utf8 XMLs
-//! - `serialize`: support serde `Serialize`/`Deserialize`
+//! `quick-xml` supports the following features:
 //!
 //! [StAX]: https://en.wikipedia.org/wiki/StAX
 //! [Serde]: https://serde.rs/
+#![cfg_attr(
+    feature = "document-features",
+    cfg_attr(doc, doc = ::document_features::document_features!())
+)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![recursion_limit = "1024"]
-
-#[cfg(feature = "encoding_rs")]
-extern crate encoding_rs;
-extern crate memchr;
-#[cfg(feature = "serialize")]
-extern crate serde;
-#[cfg(all(test, feature = "serialize"))]
-extern crate serde_value;
 
 #[cfg(feature = "serialize")]
 pub mod de;
@@ -148,14 +143,18 @@ pub mod escape {
     pub use crate::escapei::{escape, partial_escape, unescape, unescape_with};
 }
 pub mod events;
+pub mod name;
 mod reader;
 #[cfg(feature = "serialize")]
 pub mod se;
-mod utils;
+/// Not an official API, public for integration tests
+#[doc(hidden)]
+pub mod utils;
 mod writer;
 
 // reexports
 #[cfg(feature = "serialize")]
 pub use crate::errors::serialize::DeError;
 pub use crate::errors::{Error, Result};
-pub use crate::{reader::Reader, writer::Writer};
+pub use crate::reader::{Decoder, Reader};
+pub use crate::writer::{ElementWriter, Writer};

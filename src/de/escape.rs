@@ -3,7 +3,7 @@
 use crate::de::deserialize_bool;
 use crate::{errors::serialize::DeError, errors::Error, escape::unescape, reader::Decoder};
 use serde::de::{DeserializeSeed, EnumAccess, VariantAccess, Visitor};
-use serde::{self, forward_to_deserialize_any};
+use serde::{self, forward_to_deserialize_any, serde_if_integer128};
 use std::borrow::Cow;
 
 /// A deserializer for a xml escaped and encoded value
@@ -32,7 +32,7 @@ impl<'a> EscapedDeserializer<'a> {
     }
     fn unescaped(&self) -> Result<Cow<[u8]>, DeError> {
         if self.escaped {
-            unescape(&self.escaped_value).map_err(|e| DeError::Xml(Error::EscapeError(e)))
+            unescape(&self.escaped_value).map_err(|e| DeError::InvalidXml(Error::EscapeError(e)))
         } else {
             Ok(Cow::Borrowed(&self.escaped_value))
         }
@@ -45,11 +45,7 @@ macro_rules! deserialize_num {
         where
             V: Visitor<'de>,
         {
-            #[cfg(not(feature = "encoding"))]
             let value = self.decoder.decode(self.escaped_value.as_ref())?.parse()?;
-
-            #[cfg(feature = "encoding")]
-            let value = self.decoder.decode(self.escaped_value.as_ref()).parse()?;
 
             visitor.$visit(value)
         }
@@ -71,11 +67,8 @@ impl<'de, 'a> serde::Deserializer<'de> for EscapedDeserializer<'a> {
         V: Visitor<'de>,
     {
         let unescaped = self.unescaped()?;
-        #[cfg(not(feature = "encoding"))]
         let value = self.decoder.decode(&unescaped)?;
 
-        #[cfg(feature = "encoding")]
-        let value = self.decoder.decode(&unescaped);
         visitor.visit_str(&value)
     }
 
@@ -166,6 +159,11 @@ impl<'de, 'a> serde::Deserializer<'de> for EscapedDeserializer<'a> {
     deserialize_num!(deserialize_u8, visit_u8);
     deserialize_num!(deserialize_f64, visit_f64);
     deserialize_num!(deserialize_f32, visit_f32);
+
+    serde_if_integer128! {
+        deserialize_num!(deserialize_i128, visit_i128);
+        deserialize_num!(deserialize_u128, visit_u128);
+    }
 
     forward_to_deserialize_any! {
         unit_struct seq tuple tuple_struct map struct identifier ignored_any
